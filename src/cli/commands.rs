@@ -14,7 +14,10 @@ use crate::{
     config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
     meka::{MekaClient, Profile, find_profile},
-    store::{BacklogScope, NewWatch, Policy, QueueState, ReactionTarget, Store, WatchOutcome},
+    store::{
+        BacklogScope, NewWatch, Policy, QueueState, QueuedMessage, ReactionTarget, Store,
+        WatchOutcome,
+    },
     watch::{WatchField, WatchMode},
 };
 
@@ -776,34 +779,58 @@ pub async fn queue_list(config: &Config, limit: usize) -> Result<()> {
     );
     // Claiming would mark rows in flight, which is exactly what an inspection command must not do,
     // so this peeks at pending rows without touching their state.
-    let mut rows = store.peek_pending(limit).await?;
+    let pending = store.peek_pending(limit).await?;
     // What Meka has, and what is rendered and waiting on it. An operator watching a stuck queue
-    // needs the reason, and the reason is on the row.
-    rows.extend(store.rows_in(QueueState::InFlight).await?);
-    rows.extend(store.rows_in(QueueState::Posted).await?);
-    rows.sort_by_key(|row| row.seq);
-    if rows.is_empty() {
+    // needs the reason, and the reason of a post that did not go through is on the hand-over.
+    let mut hand_overs = store.hand_overs_in(QueueState::InFlight).await?;
+    hand_overs.extend(store.hand_overs_in(QueueState::Posted).await?);
+    let mut lines: Vec<(&QueuedMessage, String, u32, Option<&str>)> = pending
+        .iter()
+        .map(|row| {
+            (
+                row,
+                "waiting to be claimed".to_string(),
+                0,
+                row.last_error.as_deref(),
+            )
+        })
+        .collect();
+    for hand_over in &hand_overs {
+        for row in &hand_over.rows {
+            let (state, error) = match row.state {
+                QueueState::InFlight => (
+                    "rendered, waiting on Meka".to_string(),
+                    hand_over.last_error.as_deref(),
+                ),
+                QueueState::Posted => (
+                    format!(
+                        "with Meka as {}",
+                        hand_over.item_id.as_deref().unwrap_or("?")
+                    ),
+                    row.last_error.as_deref(),
+                ),
+                other => (other.as_str().to_string(), row.last_error.as_deref()),
+            };
+            lines.push((row, state, hand_over.posts, error));
+        }
+    }
+    lines.sort_by_key(|(row, ..)| row.seq);
+    if lines.is_empty() {
         println!("nothing waiting");
         return Ok(());
     }
     println!();
-    for row in rows.iter().take(limit) {
-        let state = match row.state {
-            QueueState::Pending => "waiting to be claimed".to_string(),
-            QueueState::InFlight => "rendered, waiting on Meka".to_string(),
-            QueueState::Posted => format!("with Meka as {}", row.item_id.as_deref().unwrap_or("?")),
-            other => other.as_str().to_string(),
-        };
+    for (row, state, posts, error) in lines.iter().take(limit) {
         println!(
             "  #{:<6} {:<28} {:<34} offers {}  posts {}  received {}",
             row.seq,
             row.conversation,
             state,
             row.attempts,
-            row.posts,
+            posts,
             row.received_at.to_rfc3339()
         );
-        if let Some(error) = &row.last_error {
+        if let Some(error) = error {
             println!("         last error: {error}");
         }
     }
@@ -1151,7 +1178,7 @@ pub async fn watch_delete(config: &Config, name: &str) -> Result<()> {
 
 /// Report what the agent has not been shown, as an exit code and one line.
 ///
-/// Built to be a scheduled job's gate, which is why it owns its exit code rather than reporting
+/// Built to be a schedule's gate, which is why it owns its exit code rather than reporting
 /// through `Result` like every other subcommand. A gate distinguishes only "fired" from "did not",
 /// so a failure that exits the same way as an honest "nothing new" produces a watcher that goes
 /// silent and stays silent. 2 keeps those apart.
@@ -1374,21 +1401,24 @@ pub async fn session_reset(config: &Config, confirmed: bool) -> Result<()> {
     // session nothing will ever ask about again, and one it has not is addressed to a session that
     // is about to stop existing. Both are closed here, and their messages go back among what the
     // agent has not seen, so the replacement meets them as a backlog rather than not at all.
-    let mut open = store.rows_in(QueueState::InFlight).await?;
-    open.extend(store.rows_in(QueueState::Posted).await?);
+    let mut open = store.hand_overs_in(QueueState::InFlight).await?;
+    open.extend(store.hand_overs_in(QueueState::Posted).await?);
     let mut owed = 0_usize;
     let mut lost = 0_usize;
-    for row in &open {
-        let Some(closed) = store
-            .failed(row.seq, "the session it belonged to was reset", Utc::now())
-            .await?
-        else {
-            continue;
-        };
-        if closed.owed {
-            owed += 1;
-        } else {
-            lost += 1;
+    for hand_over in &open {
+        let closed = store
+            .failed(
+                hand_over.id,
+                "the session it belonged to was reset",
+                Utc::now(),
+            )
+            .await?;
+        for closed in closed {
+            if closed.owed {
+                owed += 1;
+            } else {
+                lost += 1;
+            }
         }
     }
     match store.session_id().await? {

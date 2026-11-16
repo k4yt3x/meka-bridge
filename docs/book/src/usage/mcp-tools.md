@@ -183,7 +183,7 @@ How much is recorded that the agent has not been shown, and when somebody last s
 
 Asking does not count as having seen anything. Reading does: what `history_read` returns to the bridge's own session stops counting here.
 
-The answer is JSON, because the useful reader is a scheduled job:
+The answer is JSON, because the useful reader is a schedule's gate:
 
 ```json
 {
@@ -236,7 +236,7 @@ Read back what was said, including messages the agent was never woken for.
 
 This is what makes `conversation_mute` usable: somebody mentions the agent halfway through a discussion, and the discussion is here. `mute_context` already prints the last few alongside the mention, so these are for going deeper.
 
-The two cursors read opposite ways and at most one may be set. `before` pages backwards through what is already there. `after` follows a conversation forwards: it returns the **oldest** messages above the cursor, so a job sweeping a busy chat gets the next page in order rather than the latest page with a hole behind it. Keep the newest `cursor` you were handed, pass it back next time, and nothing is read twice or missed in between. A forward read that finds nothing says the chat has not moved, rather than offering the retention as a possible cause.
+The two cursors read opposite ways and at most one may be set. `before` pages backwards through what is already there. `after` follows a conversation forwards: it returns the **oldest** messages above the cursor, so a schedule sweeping a busy chat gets the next page in order rather than the latest page with a hole behind it. Keep the newest `cursor` you were handed, pass it back next time, and nothing is read twice or missed in between. A forward read that finds nothing says the chat has not moved, rather than offering the retention as a possible cause.
 
 **Reading is seeing.** What `history_read` returns stops counting as unseen, in `backlog_check` and in `conversation_list`. An entry marked `unseen: true` had not reached the agent in any form before: no read had returned it, and no wake-up had carried it or counted it, since a wake-up in a muted chat accounts for every message it says was missed, including the ones it does not quote. Before 0.20.0 only a hand-over marked anything seen, so a muted chat the agent kept up with by reading it reported the same backlog for as long as the messages were kept.
 
@@ -282,7 +282,7 @@ Each entry carries the reactions on its message in `reactions`, one per emoji in
 | `by` | Who made them, leaving out the agent: at most ten, each with `name` and `id`, and `username`, `bot` and `as_chat` (reacted as a chat rather than as a person) where they apply. `name` is absent where the platform did not give one, as Discord does not in a direct message. Absent when nobody is named |
 | `you` | The agent's own account is among them |
 
-A reaction never wakes the agent, whatever the chat's policy: somebody reacting is answering without asking for anything back, and in a busy room reactions outnumber messages. The bridge records them instead, in every chat it records messages from and under the same rules. The reactor must be admitted as their message would be, a blocked chat keeps none, and `history_retention` removes a reaction when it would remove a message said at the same moment. Taking a reaction back applies whoever does it. Reactions are not searchable and are never unseen, so they leave `backlog_check` and its `latest` marker alone, and a scheduled job watching a chat does not fire because somebody reacted.
+A reaction never wakes the agent, whatever the chat's policy: somebody reacting is answering without asking for anything back, and in a busy room reactions outnumber messages. The bridge records them instead, in every chat it records messages from and under the same rules. The reactor must be admitted as their message would be, a blocked chat keeps none, and `history_retention` removes a reaction when it would remove a message said at the same moment. Taking a reaction back applies whoever does it. Reactions are not searchable and are never unseen, so they leave `backlog_check` and its `latest` marker alone, and a schedule watching a chat does not fire because somebody reacted.
 
 On a recorded message, `reactions` holds what the platform told the bridge. Telegram keeps what happened while the bridge was down for up to a day and hands it over once it is back, and Discord replays it only when a dropped connection resumes, so a reaction made during a longer outage, across a restart on Discord, or before the bridge arrived, is missing. An `unrecorded` entry from Discord carries Discord's own count instead, with `count` and `you` but nobody in `by`. Telegram sends a bot other people's reactions only from chats where it is an administrator; see [Telegram](./telegram.md#editing-and-reactions).
 

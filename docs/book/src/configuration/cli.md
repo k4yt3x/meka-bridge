@@ -31,7 +31,7 @@ With no subcommand, Meka Bridge runs the daemon.
 | `watch write <name> (--pattern P)... [--patterns-file F] [--field text\|sender\|sender_id] [--match any\|all] [--conversation id] [--duration 7d] [--reason X]` | Create one, or replace what it holds |
 | `watch delete <name>` | Remove one |
 | `history <id> [--limit N] [--search WORDS]` | What a conversation said, including what the agent was never woken for |
-| `unseen [<id>...] [--exclude id]... [--policy active\|mute\|block]` | What the agent has not been shown, as a line and an exit code. Built to gate a scheduled job |
+| `unseen [<id>...] [--exclude id]... [--policy active\|mute\|block]` | What the agent has not been shown, as a line and an exit code. Built to gate a schedule |
 | `session show` | The bound session and what Meka says about it |
 | `session reset --yes` | Forget the binding so the next message starts a fresh session |
 | `cancel` | Cancel the turn currently running |

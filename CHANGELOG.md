@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.3] - 2026-11-16
+
+### Changed
+
+- Messages that settle together reach the agent as one inbox item, read whole before it answers.
+- Hand-over log lines speak of messages in the plural and name `hand_over` instead of `seq`.
+
+### Fixed
+
+- With Meka 0.95, a schedule's fire no longer tells the owner the bridge's turns get through again.
+
 ## [0.25.2] - 2026-11-12
 
 ### Added
@@ -703,7 +714,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.2...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.3...HEAD
+[0.25.3]: https://github.com/k4yt3x/meka-bridge/compare/0.25.2...0.25.3
 [0.25.2]: https://github.com/k4yt3x/meka-bridge/compare/0.25.1...0.25.2
 [0.25.1]: https://github.com/k4yt3x/meka-bridge/compare/0.25.0...0.25.1
 [0.25.0]: https://github.com/k4yt3x/meka-bridge/compare/0.24.4...0.25.0

@@ -1,13 +1,15 @@
-//! Builds one inbox item: the text of one message as the agent is handed it.
+//! Builds one inbox item: every message that settled together, as the agent is handed them.
 //!
 //! This is the agent's only source of routing information. A `tools/call` names the Meka session it
 //! came from but not the conversation, and one session talks to everybody, so the conversation id
 //! printed here is what the agent has to echo back to `message_send` in order to reply to the right
 //! person.
 //!
-//! One item per message, because Meka batches for itself: one turn reads every item posted around
-//! it and writes one block per item into a user message, under a header of its own. A second layer
-//! of batching here would only repeat what the server does.
+//! One item for the lot, because which messages belong together is the bridge's to say and only one
+//! item says it: Meka reads items as they reach it, so a burst posted as an item per message has
+//! its first message open a turn on its own, and the agent may answer that before it has seen the
+//! rest. Each message keeps a block of its own, with its conversation and every label, so the agent
+//! never has to look further up the item to know where a message came from or how far to trust it.
 //!
 //! User-authored text is fenced inside a per-item random nonce, without which a message reading
 //! `conversation: telegram:999` is indistinguishable from a real header and could talk the agent
@@ -173,11 +175,12 @@ impl MissedMessage {
 
 /// Everything needed to render one inbox item.
 pub struct Item<'a> {
-    /// The message this item carries.
-    pub event: &'a InboundEvent,
+    /// The messages this item carries, in the order they arrived. They are rendered grouped by
+    /// conversation, each conversation where its first message falls and oldest first within it,
+    /// so a burst reads as the exchange it was rather than interleaved with another chat's.
+    pub events: &'a [&'a InboundEvent],
     /// Messages shed because the queue was full. Reported so the agent knows its view is
-    /// incomplete rather than silently missing traffic, and carried by the first item of a claimed
-    /// pass that has one, so a burst does not say it once per message.
+    /// incomplete rather than silently missing traffic.
     pub dropped: u64,
     /// Which account the agent appears as on each connected channel, as `(channel, identity)`.
     ///
@@ -187,12 +190,9 @@ pub struct Item<'a> {
     /// compaction and never restated. A line per item is a few tokens and is always current,
     /// including after a rename.
     pub identities: &'a [(String, Option<String>)],
-    /// What this conversation owes the agent that it has not been shown, and, for a muted one, the
-    /// fact that it is muted at all.
-    ///
-    /// Carried by the first item of its conversation in a claimed pass, which is also the item the
-    /// backlog is accounted against, so a second item for the same chat states only what is left.
-    pub missed: Option<&'a MissedContext>,
+    /// What each conversation owes the agent that it has not been shown, and, for a muted one, the
+    /// fact that it is muted at all. Stated ahead of that conversation's messages.
+    pub missed: &'a [MissedContext],
     /// Fence marker for this item. Supplied by the caller so tests stay deterministic.
     pub nonce: &'a str,
 }
@@ -222,22 +222,56 @@ impl Item<'_> {
             );
         }
 
-        if let Some(missed) = self.missed {
-            self.render_missed(missed, &mut out);
+        let mut groups: Vec<(&ConversationId, Vec<&InboundMessage>)> = Vec::new();
+        for event in self.events {
+            let message = match event {
+                InboundEvent::Message(message) => message.as_ref(),
+                // None of these is ever queued, so none is ever rendered. The writer handles each
+                // and it goes no further: a retraction marks the recorded copy, a reaction is
+                // recorded on its message, and a typing notice only decides how long this
+                // conversation waits to be claimed.
+                InboundEvent::Retraction { .. }
+                | InboundEvent::Reaction(_)
+                | InboundEvent::Typing { .. } => continue,
+            };
+            match groups
+                .iter_mut()
+                .find(|(conversation, _)| **conversation == message.conversation)
+            {
+                Some((_, messages)) => messages.push(message),
+                None => groups.push((&message.conversation, vec![message])),
+            }
+        }
+        let count: usize = groups.iter().map(|(_, messages)| messages.len()).sum();
+        if count > 1 {
+            // Said because a reply to the first or the last of several is the easy mistake, and
+            // the order is what makes a burst read as one person's train of thought.
+            let _ = if groups.len() == 1 {
+                writeln!(out, "[Meka Bridge] {count} messages, oldest first.")
+            } else {
+                writeln!(
+                    out,
+                    "[Meka Bridge] {count} messages from {} conversations, each conversation's \
+                     together and oldest first.",
+                    groups.len()
+                )
+            };
         }
 
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        match self.event {
-            InboundEvent::Message(message) => self.render_message(message, &mut out),
-            // None of these is ever queued, so none is ever rendered. The writer handles each and
-            // it goes no further: a retraction marks the recorded copy, a reaction is recorded on
-            // its message, and a typing notice only decides how long this conversation waits to be
-            // claimed.
-            InboundEvent::Retraction { .. }
-            | InboundEvent::Reaction(_)
-            | InboundEvent::Typing { .. } => {}
+        for (conversation, messages) in groups {
+            if let Some(missed) = self
+                .missed
+                .iter()
+                .find(|missed| missed.conversation == *conversation)
+            {
+                self.render_missed(missed, &mut out);
+            }
+            for message in messages {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                self.render_message(message, &mut out);
+            }
         }
         out
     }
@@ -759,10 +793,20 @@ mod tests {
     }
 
     fn render(message: InboundMessage) -> String {
-        let event = InboundEvent::Message(Box::new(message));
+        render_pass(vec![message], Vec::new())
+    }
+
+    /// One claimed pass, rendered the way the session task renders it: one item, with each
+    /// conversation's backlog ahead of its messages.
+    fn render_pass(messages: Vec<InboundMessage>, missed: Vec<MissedContext>) -> String {
+        let events: Vec<InboundEvent> = messages
+            .into_iter()
+            .map(|message| InboundEvent::Message(Box::new(message)))
+            .collect();
+        let events: Vec<&InboundEvent> = events.iter().collect();
         Item {
-            missed: None,
-            event: &event,
+            events: &events,
+            missed: &missed,
             dropped: 0,
             identities: &[],
             nonce: "7c1e4b",
@@ -770,31 +814,10 @@ mod tests {
         .render()
     }
 
-    /// One claimed pass, rendered the way the session task renders it: an item per message, with
-    /// the conversation's backlog on the first item of that conversation.
-    fn render_pass(messages: Vec<InboundMessage>, missed: Option<MissedContext>) -> Vec<String> {
-        let mut stated = false;
-        messages
-            .into_iter()
-            .map(|message| {
-                let event = InboundEvent::Message(Box::new(message));
-                let missed = missed
-                    .as_ref()
-                    .filter(|_| !std::mem::replace(&mut stated, true));
-                Item {
-                    missed,
-                    event: &event,
-                    dropped: 0,
-                    identities: &[],
-                    nonce: "7c1e4b",
-                }
-                .render()
-            })
-            .collect()
-    }
-
-    fn render_with_missed(message: InboundMessage, missed: MissedContext) -> String {
-        render_pass(vec![message], Some(missed)).remove(0)
+    /// One message with what its conversation owes the agent, which is always its own.
+    fn render_with_missed(mut message: InboundMessage, missed: MissedContext) -> String {
+        message.conversation = missed.conversation.clone();
+        render_pass(vec![message], vec![missed])
     }
 
     fn missed_message(sender: &str, text: &str) -> MissedMessage {
@@ -891,7 +914,7 @@ mod tests {
         let mut overheard = message("unrelated");
         overheard.chat_kind = ChatKind::Group;
         overheard.addressed = false;
-        let rendered = render_pass(vec![named, overheard], None).join("\n");
+        let rendered = render_pass(vec![named, overheard], Vec::new());
         assert_eq!(rendered.matches("woke you:").count(), 2, "got {rendered}");
     }
 
@@ -1128,8 +1151,8 @@ mod tests {
         }];
 
         let rendered = Item {
-            missed: None,
-            event: &InboundEvent::Message(Box::new(message)),
+            missed: &[],
+            events: &[&InboundEvent::Message(Box::new(message))],
             dropped: 0,
             // Operator-set rather than attacker-set, but it is a line above the fence built from a
             // string the bridge did not mint, so it holds to the same rule.
@@ -1388,22 +1411,55 @@ mod tests {
     }
 
     #[test]
-    fn a_claimed_pass_renders_one_item_per_message() {
-        // Meka writes a header of its own above each item and reads them into one turn in the order
-        // they were posted, so numbering them here would be the bridge repeating what the server
-        // says, in words that could disagree with it.
-        let items = render_pass(
-            vec![message("first"), message("second"), message("third")],
-            None,
+    fn a_claimed_pass_is_one_item_with_each_conversation_together() {
+        // Arrival interleaves chats; the agent reads each chat's messages together and oldest
+        // first, behind what that chat owes it, so a burst reads as the exchange it was. Every
+        // message keeps a block of its own, conversation line included, so none depends on a
+        // header further up the item.
+        let elsewhere = |text: &str| {
+            let mut message = message(text);
+            message.conversation = ConversationId::parse("telegram:-100555").expect("id");
+            message
+        };
+        let rendered = render_pass(
+            vec![
+                message("first"),
+                elsewhere("aside"),
+                message("second"),
+                message("third"),
+            ],
+            vec![MissedContext {
+                conversation: ConversationId::parse("telegram:-100555").expect("id"),
+                muted: true,
+                count: 2,
+                recent: Vec::new(),
+            }],
         );
-        assert_eq!(items.len(), 3);
-        for (item, text) in items.iter().zip(["first", "second", "third"]) {
-            assert!(item.contains(text), "got:\n{item}");
-            assert!(
-                !item.contains("--- message"),
-                "an item is one message, so it has nothing to number:\n{item}"
-            );
-        }
+        assert!(
+            rendered.starts_with("[Meka Bridge] 4 messages from 2 conversations"),
+            "got:\n{rendered}"
+        );
+        let order: Vec<usize> = [
+            "\nfirst\n7c1e4b>>>",
+            "\nsecond\n7c1e4b>>>",
+            "\nthird\n7c1e4b>>>",
+            "only woken in telegram:-100555",
+            "\naside\n7c1e4b>>>",
+        ]
+        .iter()
+        .map(|part| rendered.find(part).expect("every part is rendered"))
+        .collect();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "got:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("\nconversation: ").count(),
+            4,
+            "got:\n{rendered}"
+        );
+        let alone = render(message("alone"));
+        assert!(!alone.contains("oldest first"), "got:\n{alone}");
     }
 
     #[test]
@@ -1456,8 +1512,8 @@ mod tests {
     fn dropped_messages_are_reported_to_the_agent() {
         let event = InboundEvent::Message(Box::new(message("hi")));
         let rendered = Item {
-            missed: None,
-            event: &event,
+            missed: &[],
+            events: &[&event],
             dropped: 3,
             identities: &[],
             nonce: "abc",
@@ -1473,8 +1529,8 @@ mod tests {
     fn dropped_message_wording_is_singular_for_one() {
         let event = InboundEvent::Message(Box::new(message("hi")));
         let rendered = Item {
-            missed: None,
-            event: &event,
+            missed: &[],
+            events: &[&event],
             dropped: 1,
             identities: &[],
             nonce: "abc",
@@ -1953,7 +2009,7 @@ mod tests {
         first.group_id = Some("13294839284".to_string());
         let mut second = message("");
         second.group_id = Some("13294839284".to_string());
-        let rendered = render_pass(vec![first, second], None).join("\n");
+        let rendered = render_pass(vec![first, second], Vec::new());
         assert_eq!(rendered.matches("album: 13294839284").count(), 2);
     }
 
@@ -2040,8 +2096,8 @@ mod tests {
         let event = InboundEvent::Message(Box::new(message("hi")));
         let identities = [("telegram".to_string(), Some("@mybot".to_string()))];
         let rendered = Item {
-            missed: None,
-            event: &event,
+            missed: &[],
+            events: &[&event],
             dropped: 0,
             identities: &identities,
             nonce: "abc",
@@ -2061,8 +2117,8 @@ mod tests {
             ("discord".to_string(), Some("Mica#1234".to_string())),
         ];
         let rendered = Item {
-            missed: None,
-            event: &event,
+            missed: &[],
+            events: &[&event],
             dropped: 0,
             identities: &identities,
             nonce: "abc",
@@ -2080,8 +2136,8 @@ mod tests {
         let event = InboundEvent::Message(Box::new(message("hi")));
         let identities = [("telegram".to_string(), None)];
         let rendered = Item {
-            missed: None,
-            event: &event,
+            missed: &[],
+            events: &[&event],
             dropped: 0,
             identities: &identities,
             nonce: "abc",

@@ -4,7 +4,7 @@ Meka Bridge connects a [Meka](https://github.com/k4yt3x/meka) agent to messaging
 
 The design treats the agent as a person with a phone.
 
-- **Inbound** messages from every configured channel are queued and handed to the agent through Meka's session inbox, one item per message. Meka reads them all into one turn, so a burst costs one turn rather than one each, and something that arrives while the agent is working reaches it inside that same turn, the way a person glances at a message mid-task.
+- **Inbound** messages from every configured channel are queued and handed to the agent through Meka's session inbox, everything that settled together as one item. The agent reads a burst whole before answering any of it, at the cost of one turn rather than one each, and something that arrives while the agent is working reaches it inside that same turn, the way a person glances at a message mid-task.
 - **Outbound** messages happen only because the agent called a tool. The bridge never writes chat content of its own. Replying, staying quiet, replying to somebody else, replying on a different platform, or messaging first tomorrow morning are all the agent's decisions.
 
 One Meka Bridge instance owns exactly one Meka session, permanently. That session is the agent's memory: everyone it has talked to, on every platform, in one continuous context.

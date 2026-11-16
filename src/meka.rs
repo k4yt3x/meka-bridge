@@ -744,7 +744,8 @@ impl MekaClient {
     /// `POST /v1/sessions/{id}/cancel`. Idempotent server-side, so a retry is safe.
     ///
     /// With a `turn_id` Meka stops only that turn and answers `409 turn-mismatch` when another is
-    /// running, so a caller that watched one turn cannot stop the scheduled fire that replaced it.
+    /// running, so a caller that watched one turn cannot stop the turn on a schedule's fire that
+    /// replaced it.
     /// Without one it stops whatever runs, which is what the operator's `meka-bridge cancel` means.
     pub async fn cancel_turn(&self, session_id: Uuid, turn_id: Option<&str>) -> Result<()> {
         let url = self.endpoint(&format!("/v1/sessions/{session_id}/cancel"))?;

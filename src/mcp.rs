@@ -2387,7 +2387,7 @@ impl BridgeMcpServer {
                        `exclude` alone still covers active chats, which wake you anyway. \
                        `latest` moves when somebody else says something new, and also when a \
                        message is deleted or a chat joins or leaves the chats asked about, so a \
-                       scheduled job watching `/latest` for a change spends a turn only then. \
+                       schedule watching `/latest` for a change fires only then. \
                        `newest` is present only while something is unseen, so watching \
                        `/newest` for `not_empty` fires until every unseen message has been read, \
                        every page of it. Never gate on `unseen`: it falls whenever you read, and \
@@ -2411,8 +2411,8 @@ impl BridgeMcpServer {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "`conversation` was replaced by `conversations`, a list, in Meka Bridge 0.20.0: \
                  pass `conversations: [\"{id}\"]` for that chat, or leave both out for every \
-                 chat. A scheduled job's gate keeps the arguments it was created with, so a \
-                 job passing `conversation` has to be recreated with the new one."
+                 chat. A schedule's gate keeps the arguments it was created with, so a \
+                 schedule passing `conversation` has to be recreated with the new one."
             ))]));
         }
         // Refused rather than combined. Naming chats promises each one an entry, and a filter
@@ -5096,10 +5096,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_backlog_answers_with_the_field_a_gate_points_at() {
-        // The shape is the contract. Meka's scheduler gates a job by pointing a JSON pointer into
-        // this result, so `latest` has to be a field it can name rather than prose to parse, and
-        // it has to be separate from `unseen`: the backlog falls every time the agent reads, so a
-        // gate watching that for a change fires on the reading.
+        // The shape is the contract. Meka's scheduler gates a schedule by pointing a JSON pointer
+        // into this result, so `latest` has to be a field it can name rather than prose to parse,
+        // and it has to be separate from `unseen`: the backlog falls every time the agent reads, so
+        // a gate watching that for a change fires on the reading.
         let (server, _sink) = server_with(FakeSink {
             history: vec![history_entry("telegram:1", "1", "the deploy is stuck")],
             ..FakeSink::default()

@@ -1,13 +1,13 @@
 //! The inbound path: channel events into the durable queue, and the queue into Meka's inbox.
 //!
 //! Two tasks, deliberately separate: the writer persists every event before acknowledging it, and
-//! the session task claims messages, hands each to Meka as an inbox item of its own, and acts on
-//! what the session feed says became of them. One session task means the bridge never races itself
-//! on a row's state.
+//! the session task claims messages, hands them to Meka as inbox items, and acts on what the
+//! session feed says became of them. One session task means the bridge never races itself on a
+//! row's state.
 //!
-//! Messages that settle together are claimed together and handed over one after another, which is
-//! what makes somebody who puts their phone down cost one provider round trip rather than several:
-//! Meka reads them all into one turn, under a header of its own per item. What arrives while the
+//! Messages that settle together are claimed together and handed over as one item, which is what
+//! makes somebody who puts their phone down cost one provider round trip rather than several, and
+//! has the agent read everything they said before it answers any of it. What arrives while the
 //! agent is working reaches it inside that turn, at its next round boundary; nothing waits for a
 //! turn to end.
 
@@ -39,7 +39,7 @@ use crate::{
         sse::{TurnEvent, TurnSource},
     },
     store::{
-        AccountId, Backlog, ConversationRecord, EnqueueOutcome, HandOver, MessageKey, Offer,
+        AccountId, Backlog, ConversationRecord, EnqueueOutcome, HandOver, MessageKey, NewHandOver,
         Policy, PolicyRecord, QueueState, QueuedMessage, Recovered, Store, Undelivered,
         WatchRecord,
     },
@@ -1024,7 +1024,7 @@ async fn work_queue(
         if shutdown.is_cancelled() {
             return None;
         }
-        let waiting = match context.store.rows_in(QueueState::InFlight).await {
+        let waiting = match context.store.hand_overs_in(QueueState::InFlight).await {
             Ok(waiting) => waiting,
             Err(error) => {
                 tracing::error!("could not read what is waiting for Meka: {}", error);
@@ -1033,8 +1033,8 @@ async fn work_queue(
         };
         // Oldest first, and nothing new is claimed while one waits, so what reaches the agent stays
         // in the order it was said.
-        if let Some(row) = waiting.into_iter().next() {
-            if let Some(not_before) = row.not_before {
+        if let Some(hand_over) = waiting.into_iter().next() {
+            if let Some(not_before) = hand_over.not_before {
                 // Clamped on the way out as well as on the way in: a host clock stepping backwards
                 // would otherwise hold the message for the whole size of the jump.
                 let remaining = (not_before - Utc::now())
@@ -1045,12 +1045,25 @@ async fn work_queue(
                     return Some(remaining);
                 }
             }
-            if !post(context, session_id, &row, shutdown).await {
+            if !post(context, session_id, &hand_over, shutdown).await {
                 // Nothing was written against the post, so coming straight back would make the same
                 // request again with no error able to stop it.
                 return Some(DRAIN_POLL_INTERVAL);
             }
             continue;
+        }
+        // Ahead of the next claim, a claim the last hold could not make into a hand-over, nor hand
+        // back, goes back to the queue: nothing else will release it short of a restart.
+        match context.store.release_unrendered().await {
+            Ok(0) => {}
+            Ok(released) => tracing::warn!(
+                released,
+                "claimed messages nothing was rendered for are back in the queue"
+            ),
+            Err(error) => {
+                tracing::error!("could not release claimed messages: {}", error);
+                return Some(DRAIN_POLL_INTERVAL);
+            }
         }
         let Readiness { ready, retry_in } = readiness(context).await;
         if ready.is_empty() {
@@ -1076,19 +1089,21 @@ async fn work_queue(
     }
 }
 
-/// Render every claimed row into an inbox item, each under a key of its own.
+/// Render every claimed row into one inbox item, under one key.
 ///
-/// What is stated once rather than per message is stated by the first item entitled to it: the
-/// dropped-message count by the first item of the pass, and a conversation's backlog by the first
-/// item of that conversation. Both are recorded against that row in the same transaction that
-/// stores the item, so a hand-over that dies gives back exactly what it took.
+/// One item for the pass, because which messages belong together is the bridge's to say: posted as
+/// an item each, the first would open a turn on its own and the agent could answer it before it had
+/// read the rest. What is stated once rather than per message is stated once in it: the
+/// dropped-message count at the top, and a conversation's backlog ahead of its messages, accounted
+/// against that conversation's first row in the same transaction that stores the item, so a
+/// hand-over that dies gives back exactly what it took.
 ///
-/// `false` when the store would not take a hand-over, so the rows still to be rendered are back
-/// where they were and rendering them again at once would be a loop.
+/// `false` when the store would not take the hand-over, so the rows are back where they were and
+/// rendering them again at once would be a loop.
 async fn hold(context: &SessionContext, session_id: Uuid, claimed: &[QueuedMessage]) -> bool {
     // Read rather than taken: the count comes off when the item stating it is stored, so a failure
     // between here and there loses the item and keeps the count.
-    let mut dropped = context.store.peek_dropped().await.unwrap_or_else(|error| {
+    let dropped = context.store.peek_dropped().await.unwrap_or_else(|error| {
         tracing::error!("failed to read the dropped-message counter: {}", error);
         0
     });
@@ -1115,6 +1130,9 @@ async fn hold(context: &SessionContext, session_id: Uuid, claimed: &[QueuedMessa
     {
         tracing::error!("failed to discard undecodable payloads: {}", error);
     }
+    if events.is_empty() {
+        return true;
+    }
 
     // The newest arrival per conversation in this pass, which is the ceiling its backlog may be
     // counted to: a message claimed alongside is already being handed over, so counting it as
@@ -1129,122 +1147,106 @@ async fn hold(context: &SessionContext, session_id: Uuid, claimed: &[QueuedMessa
     }
 
     let mut stated: BTreeSet<&str> = BTreeSet::new();
-    let mut conversations: BTreeSet<&str> = BTreeSet::new();
-    let mut held = 0_usize;
-    for (index, (seq, event)) in events.iter().enumerate() {
-        let (missed, backlog) = match event {
-            InboundEvent::Message(message) if stated.insert(message.conversation.as_str()) => {
-                let through = newest
-                    .get(message.conversation.as_str())
-                    .copied()
-                    .unwrap_or_else(Utc::now);
-                missed_context(context, message, through).await
-            }
-            _ => (None, None),
-        };
-        let nonce = nonce();
-        let body = Item {
-            event,
-            dropped,
-            identities: context.accounts.identities(),
-            missed: missed.as_ref(),
-            nonce: &nonce,
-        }
-        .render();
-        let key = format!("meka-bridge-{}", Uuid::new_v4());
-        let item = HandOver {
-            key: &key,
-            body: &body,
-            session_id,
-            dropped,
-            accounted: backlog,
-        };
-        match context.store.hold(*seq, item, Utc::now()).await {
-            Ok(true) => {
-                // Said once per pass, by whichever item got there first.
-                dropped = 0;
-                held += 1;
-                conversations.insert(event.conversation().as_str());
-            }
-            // Only reachable if something outside this task moved the row, which nothing does.
-            Ok(false) => tracing::warn!(seq, "a claimed message was gone before it was rendered"),
-            Err(error) => {
-                tracing::error!(seq, "failed to record a hand-over: {}", error);
-                // Back to the queue untouched: nothing was rendered for any of them and no offer
-                // was spent.
-                let unrendered: Vec<i64> = events[index..].iter().map(|(seq, _)| *seq).collect();
-                if let Err(error) = context.store.unclaim(&unrendered).await {
-                    tracing::error!("failed to release unrendered messages: {}", error);
-                }
-                return false;
+    let mut missed = Vec::new();
+    let mut accounted = Vec::new();
+    for (seq, event) in &events {
+        if let InboundEvent::Message(message) = event
+            && stated.insert(message.conversation.as_str())
+        {
+            let through = newest
+                .get(message.conversation.as_str())
+                .copied()
+                .unwrap_or_else(Utc::now);
+            let (owed, backlog) = missed_context(context, message, through).await;
+            missed.extend(owed);
+            if let Some(backlog) = backlog {
+                accounted.push((*seq, backlog));
             }
         }
     }
-    if held > 0 {
-        tracing::info!(
-            messages = held,
-            conversations = conversations.len(),
-            "rendered messages for the agent"
-        );
+    let nonce = nonce();
+    let rendered: Vec<&InboundEvent> = events.iter().map(|(_, event)| event).collect();
+    let body = Item {
+        events: &rendered,
+        dropped,
+        identities: context.accounts.identities(),
+        missed: &missed,
+        nonce: &nonce,
     }
-    true
+    .render();
+    let key = format!("meka-bridge-{}", Uuid::new_v4());
+    let rows: Vec<i64> = events.iter().map(|(seq, _)| *seq).collect();
+    let item = NewHandOver {
+        key: &key,
+        body: &body,
+        session_id,
+        rows: &rows,
+        dropped,
+        accounted: &accounted,
+    };
+    let refused = match context.store.hold(item, Utc::now()).await {
+        Ok(Some(hand_over)) => {
+            tracing::info!(
+                hand_over,
+                messages = rows.len(),
+                conversations = stated.len(),
+                "rendered messages for the agent"
+            );
+            return true;
+        }
+        // Only reachable if something outside this task moved a row, which nothing does.
+        Ok(None) => "claimed messages were gone before they were rendered".to_string(),
+        Err(error) => format!("failed to record a hand-over: {error}"),
+    };
+    tracing::error!("{}", refused);
+    // Back to the queue untouched: nothing was stored for any of them and no offer was spent.
+    if let Err(error) = context.store.unclaim(&rows).await {
+        tracing::error!("failed to release unrendered messages: {}", error);
+    }
+    false
 }
 
-/// Hand one message to Meka, and write down what came of the attempt.
+/// Hand one item to Meka, and write down what came of the attempt.
 ///
-/// `false` when the store would not take that outcome, so the row is still `in_flight` with nothing
-/// recorded against it: no item id, no wait, no failure. Posting it again at once would be a
-/// request loop against Meka that no error could end, so the caller stops working the queue until
+/// `false` when the store would not take that outcome, so the hand-over is still waiting with
+/// nothing recorded against it: no item id, no wait, no failure. Posting it again at once would be
+/// a request loop against Meka that no error could end, so the caller stops working the queue until
 /// the next round instead.
 async fn post(
     context: &SessionContext,
     session_id: &mut Uuid,
-    row: &QueuedMessage,
+    hand_over: &HandOver,
     shutdown: &CancellationToken,
 ) -> bool {
-    let (key, body) = match (row.key.as_deref(), row.body.as_deref()) {
-        (Some(key), Some(body)) => (key, body),
-        // A claim whose render never landed, which only a crash between the two leaves behind and
-        // which startup recovery puts back. Nothing was minted and Meka has nothing, so offering
-        // the message again is free.
-        (None, _) => {
-            tracing::error!(
-                seq = row.seq,
-                "a message is in flight with nothing rendered for it"
-            );
-            if let Err(error) = context.store.unclaim(&[row.seq]).await {
-                tracing::error!("failed to release an unrendered message: {}", error);
-                return false;
-            }
-            return true;
-        }
-        // A key with no request kept behind it, which nothing here produces and only a database
-        // edited by hand could hold. It cannot be posted, and it must not be offered again either:
-        // Meka may hold an item under that key already, so a fresh one would hand the same message
-        // over twice. `unclaim` refuses a row that has a key, for that reason, so returning true
-        // here would come straight back to this row and spin. Failing it is the one move that both
+    let Some(body) = hand_over.body.as_deref() else {
+        // A hand-over waiting on Meka with no request kept behind it, which nothing here produces
+        // and only a database edited by hand could hold. It cannot be posted, and its messages
+        // must not be offered again either: Meka may hold an item under that key already, so a
+        // fresh one would hand the same messages over twice. Failing it is the one move that both
         // ends the round and says so.
-        (Some(_), None) => {
-            tracing::error!(
-                seq = row.seq,
-                "a message is in flight under a key with no request kept for it"
-            );
-            return fail(
-                context,
-                row,
-                "the request it was handed over as was not kept",
-                Retry::Never,
-            )
-            .await;
-        }
+        tracing::error!(
+            hand_over = hand_over.id,
+            "a hand-over is waiting on Meka with no request kept for it"
+        );
+        return fail(
+            context,
+            hand_over,
+            "the request it was handed over as was not kept",
+            Retry::Never,
+        )
+        .await;
     };
     let now = Utc::now();
-    match context.meka.post_inbox(*session_id, body, key).await {
+    match context
+        .meka
+        .post_inbox(*session_id, body, &hand_over.key)
+        .await
+    {
         Ok(receipt) => {
             if let Err(error) = context
                 .store
                 .posted(
-                    row.seq,
+                    hand_over.id,
                     *session_id,
                     &receipt.item_id,
                     now,
@@ -1252,19 +1254,24 @@ async fn post(
                 )
                 .await
             {
-                tracing::error!(seq = row.seq, "failed to record a hand-over: {}", error);
+                tracing::error!(
+                    hand_over = hand_over.id,
+                    "failed to record a hand-over: {}",
+                    error
+                );
                 return false;
             }
             tracing::info!(
-                seq = row.seq,
+                hand_over = hand_over.id,
+                messages = hand_over.rows.len(),
                 item = %receipt.item_id,
                 replayed = receipt.replayed,
-                "handed a message to the agent"
+                "handed messages to the agent"
             );
-            // A replayed key answers with the item's current state, which for a message posted
+            // A replayed key answers with the item's current state, which for an item posted
             // before a restart may already be its fate.
             if receipt.replayed {
-                settle_replayed(context, row, &receipt).await;
+                settle_replayed(context, hand_over, &receipt).await;
             }
             true
         }
@@ -1274,65 +1281,63 @@ async fn post(
                     "Meka no longer knows session {session_id}, and [session].recreate_on_missing \
                      is off; nothing can be handed over until one is bound"
                 );
-                return defer(context, row, &error, now).await;
+                return defer(context, hand_over, &error, now).await;
             }
-            // The row stays in flight, so the loop posts it into whatever is bound next -- but only
-            // if a replacement was actually bound.
+            // The hand-over stays waiting, so the loop posts it into whatever is bound next -- but
+            // only if a replacement was actually bound.
             rebind(context, session_id, shutdown).await
         }
         Err(error) if error.is_retryable() || error.is_session_locked() => {
-            defer(context, row, &error, now).await
+            defer(context, hand_over, &error, now).await
         }
         Err(error) => {
             // A failure needing an operator will not stop happening on its own, so spending the
             // hour on it only delays the notice that says so.
-            tracing::error!(seq = row.seq, "Meka refused a message: {}", error);
-            fail(context, row, &error.to_string(), Retry::Never).await
+            tracing::error!(hand_over = hand_over.id, "Meka refused messages: {}", error);
+            fail(context, hand_over, &error.to_string(), Retry::Never).await
         }
     }
 }
 
-/// Write down a post that did not go through, or give up once the message has waited long enough.
+/// Write down a post that did not go through, or give up once the item has waited long enough.
 ///
-/// `false` when neither could be written, which leaves the row exactly as it was.
+/// `false` when neither could be written, which leaves the hand-over exactly as it was.
 async fn defer(
     context: &SessionContext,
-    row: &QueuedMessage,
+    hand_over: &HandOver,
     error: &MekaError,
     now: DateTime<Utc>,
 ) -> bool {
-    let waited = row.held_at.map_or(Duration::ZERO, |held_at| {
-        (now - held_at).to_std().unwrap_or(Duration::ZERO)
-    });
+    let waited = (now - hand_over.held_at).to_std().unwrap_or(Duration::ZERO);
     if waited >= context.config.bridge.hand_over_within {
         tracing::error!(
-            seq = row.seq,
-            posts = row.posts + 1,
-            "giving up on a message Meka never accepted: {}",
+            hand_over = hand_over.id,
+            posts = hand_over.posts + 1,
+            "giving up on messages Meka never accepted: {}",
             error
         );
-        return fail(context, row, &error.to_string(), Retry::Unaccepted).await;
+        return fail(context, hand_over, &error.to_string(), Retry::Unaccepted).await;
     }
     let delay = retry_delay(
         context.config.bridge.retry_base,
-        row.posts,
+        hand_over.posts,
         error.retry_after(),
     );
     tracing::warn!(
-        seq = row.seq,
-        posts = row.posts + 1,
+        hand_over = hand_over.id,
+        posts = hand_over.posts + 1,
         retry_in = ?delay,
-        "Meka did not accept a message ({}); trying again",
+        "Meka did not accept messages ({}); trying again",
         error
     );
     let not_before = now + chrono::Duration::from_std(delay).unwrap_or_default();
     if let Err(error) = context
         .store
-        .defer(row.seq, &error.to_string(), not_before)
+        .defer(hand_over.id, &error.to_string(), not_before)
         .await
     {
         tracing::error!(
-            seq = row.seq,
+            hand_over = hand_over.id,
             "failed to record a deferred hand-over: {}",
             error
         );
@@ -1351,7 +1356,7 @@ async fn defer(
 ///
 /// `false` when the bridge still holds the same session afterwards, which happens when the stale
 /// binding could not be cleared: [`ensure_session`] then hands the dead id straight back. The
-/// caller has to stop rather than carry on, because nothing was written against the message that
+/// caller has to stop rather than carry on, because nothing was written against the hand-over that
 /// hit the 404 either, so coming back to it would post to the same dead session at whatever rate
 /// the two requests take.
 async fn rebind(
@@ -1370,11 +1375,11 @@ async fn rebind(
         tracing::error!("failed to clear the stale session binding: {}", error);
     }
     context.position.store(0, Ordering::SeqCst);
-    match context.store.rows_in(QueueState::Posted).await {
+    match context.store.hand_overs_in(QueueState::Posted).await {
         Ok(posted) => {
-            let stranded: Vec<QueuedMessage> = posted
+            let stranded: Vec<HandOver> = posted
                 .into_iter()
-                .filter(|row| row.session_id == Some(old))
+                .filter(|hand_over| hand_over.session_id == old)
                 .collect();
             fail_all(
                 context,
@@ -1406,18 +1411,21 @@ async fn rebind(
 /// Close a hand-over that will never reach the model, and tell whoever is waiting.
 ///
 /// `false` when the store would not close it, so it is still open and still refusable.
-async fn fail(context: &SessionContext, row: &QueuedMessage, reason: &str, retry: Retry) -> bool {
-    match context.store.failed(row.seq, reason, Utc::now()).await {
+async fn fail(context: &SessionContext, hand_over: &HandOver, reason: &str, retry: Retry) -> bool {
+    match context.store.failed(hand_over.id, reason, Utc::now()).await {
         // Something else closed it first, so somebody has already been told whatever there was to
         // tell.
-        Ok(None) => true,
-        Ok(Some(closed)) => {
-            let posts = closed.row.posts.max(1);
-            give_up(context, std::slice::from_ref(&closed), reason, retry, posts).await;
+        Ok(closed) if closed.is_empty() => true,
+        Ok(closed) => {
+            give_up(context, &closed, reason, retry, hand_over.posts.max(1)).await;
             true
         }
         Err(error) => {
-            tracing::error!(seq = row.seq, "failed to record a lost message: {}", error);
+            tracing::error!(
+                hand_over = hand_over.id,
+                "failed to record lost messages: {}",
+                error
+            );
             false
         }
     }
@@ -1428,26 +1436,29 @@ async fn fail(context: &SessionContext, row: &QueuedMessage, reason: &str, retry
 /// Together rather than one notice each, because that is what they are to the person reading them:
 /// a session that went, a reset, one outage. Failures that happen independently still get a notice
 /// each, bounded by [`NoticeLog`].
-async fn fail_all(context: &SessionContext, rows: &[QueuedMessage], reason: &str, retry: Retry) {
-    let mut closed = Vec::with_capacity(rows.len());
-    for row in rows {
-        match context.store.failed(row.seq, reason, Utc::now()).await {
-            Ok(Some(undelivered)) => closed.push(undelivered),
-            Ok(None) => {}
+async fn fail_all(context: &SessionContext, hand_overs: &[HandOver], reason: &str, retry: Retry) {
+    let mut closed = Vec::new();
+    let mut posts = 1;
+    for hand_over in hand_overs {
+        match context.store.failed(hand_over.id, reason, Utc::now()).await {
+            Ok(undelivered) => {
+                if !undelivered.is_empty() {
+                    posts = posts.max(hand_over.posts);
+                }
+                closed.extend(undelivered);
+            }
             Err(error) => {
-                tracing::error!(seq = row.seq, "failed to record a lost message: {}", error);
+                tracing::error!(
+                    hand_over = hand_over.id,
+                    "failed to record lost messages: {}",
+                    error
+                );
             }
         }
     }
     if closed.is_empty() {
         return;
     }
-    let posts = closed
-        .iter()
-        .map(|closed| closed.row.posts)
-        .max()
-        .unwrap_or(1)
-        .max(1);
     give_up(context, &closed, reason, retry, posts).await;
 }
 
@@ -1489,16 +1500,17 @@ async fn give_up(
 
 /// Close a hand-over the model read. `false` for one already closed.
 ///
-/// Nothing is marked seen here: the backlog this item stated was accounted for against its row when
+/// Nothing is marked seen here: each backlog the item stated was accounted for against its row when
 /// the item was rendered, which is what lets a second item for the same chat state only what is
 /// left while this one is still outstanding.
-async fn deliver(context: &SessionContext, row: &QueuedMessage) -> bool {
-    match context.store.delivered(row.seq, Utc::now()).await {
+async fn deliver(context: &SessionContext, hand_over: &HandOver) -> bool {
+    match context.store.delivered(hand_over.id, Utc::now()).await {
         Ok(true) => {
             tracing::info!(
-                seq = row.seq,
-                conversation = %row.conversation,
-                "the agent read a message"
+                hand_over = hand_over.id,
+                messages = hand_over.rows.len(),
+                conversations = conversations_of(&hand_over.rows).len(),
+                "the agent read messages"
             );
             true
         }
@@ -1506,8 +1518,8 @@ async fn deliver(context: &SessionContext, row: &QueuedMessage) -> bool {
         Ok(false) => false,
         Err(error) => {
             tracing::error!(
-                seq = row.seq,
-                "failed to record a delivered message: {}",
+                hand_over = hand_over.id,
+                "failed to record delivered messages: {}",
                 error
             );
             false
@@ -1515,23 +1527,30 @@ async fn deliver(context: &SessionContext, row: &QueuedMessage) -> bool {
     }
 }
 
-/// Offer a message again, for a hand-over that came apart with nobody answered.
+/// Offer a hand-over's messages again, for a hand-over that came apart with nobody answered.
 ///
-/// `delay` holds it back before the next claim. Right for an item Meka took back, where whatever
+/// `delay` holds them back before the next claim. Right for an item Meka took back, where whatever
 /// took it back is probably still true a moment later; wrong for a turn that read it and produced
 /// nothing, where the agent is idle and the only cost of waiting is the silence.
 async fn offer_again(
     context: &SessionContext,
-    row: &QueuedMessage,
+    hand_over: i64,
     reason: &str,
     delay: Option<Duration>,
 ) {
     let now = Utc::now();
     let not_before = delay.map(|delay| now + chrono::Duration::from_std(delay).unwrap_or_default());
+    let posts = match context.store.hand_over(hand_over).await {
+        Ok(found) => found.map_or(1, |found| found.posts.max(1)),
+        Err(error) => {
+            tracing::error!(hand_over, "could not read a hand-over: {}", error);
+            1
+        }
+    };
     let offer = match context
         .store
         .reoffer(
-            row.seq,
+            hand_over,
             reason,
             context.config.bridge.max_offers,
             not_before,
@@ -1541,67 +1560,67 @@ async fn offer_again(
     {
         Ok(offer) => offer,
         Err(error) => {
-            tracing::error!(seq = row.seq, "failed to offer a message again: {}", error);
+            tracing::error!(hand_over, "failed to offer messages again: {}", error);
             return;
         }
     };
-    match offer {
-        Offer::Retrying => tracing::warn!(
-            seq = row.seq,
-            conversation = %row.conversation,
-            "a message did not reach the agent ({}); it is offered again",
+    if !offer.retrying.is_empty() {
+        let conversations: Vec<String> = conversations_of(&offer.retrying)
+            .iter()
+            .map(|conversation| conversation.as_str().to_string())
+            .collect();
+        tracing::warn!(
+            hand_over,
+            messages = offer.retrying.len(),
+            conversations = %conversations.join(", "),
+            "messages did not reach the agent ({}); they are offered again",
             reason
-        ),
-        Offer::Exhausted(exhausted) => {
-            let posts = exhausted.row.posts.max(1);
-            give_up(
-                context,
-                std::slice::from_ref(&*exhausted),
-                reason,
-                Retry::Undelivered,
-                posts,
-            )
-            .await;
-        }
-        Offer::Closed => {}
+        );
+    }
+    if !offer.exhausted.is_empty() {
+        give_up(context, &offer.exhausted, reason, Retry::Undelivered, posts).await;
     }
 }
 
 /// Act on what a replayed key said the item had become.
-async fn settle_replayed(context: &SessionContext, row: &QueuedMessage, receipt: &InboxReceipt) {
+async fn settle_replayed(context: &SessionContext, hand_over: &HandOver, receipt: &InboxReceipt) {
     match &receipt.state {
         InboxState::Delivered => {
-            deliver(context, row).await;
+            deliver(context, hand_over).await;
         }
         // Given up on while this bridge was not listening. The receipt carries what the
-        // `inbox.failed` it missed would have, so the message meets the same end it would have met
-        // live, rather than a fresh item meeting the same failure.
+        // `inbox.failed` it missed would have, so the messages meet the same end they would have
+        // met live, rather than a fresh item meeting the same failure.
         InboxState::Withdrawn if receipt.last_error.is_some() => {
             let reason = given_up_reason(
                 receipt.failure.as_deref().unwrap_or("Meka gave up on it"),
                 receipt.last_error.as_ref(),
             );
-            tracing::error!(seq = row.seq, "Meka gave up on a message: {}", reason);
-            fail(context, row, &reason, Retry::Undelivered).await;
+            tracing::error!(
+                hand_over = hand_over.id,
+                "Meka gave up on messages: {}",
+                reason
+            );
+            fail(context, hand_over, &reason, Retry::Undelivered).await;
         }
         InboxState::Withdrawn => {
             // Taken back unread with no failure behind it: a cancelled turn, or a `DELETE`. The
-            // message is still owed, so it is offered again.
+            // messages are still owed, so they are offered again.
             offer_again(
                 context,
-                row,
+                hand_over.id,
                 "Meka took it back before the agent read it",
                 Some(context.config.bridge.retry_base),
             )
             .await;
         }
         state @ (InboxState::Pending | InboxState::Appended) => {
-            tracing::debug!(seq = row.seq, state = %state, "a message is still with Meka");
+            tracing::debug!(hand_over = hand_over.id, state = %state, "messages are still with Meka");
         }
         InboxState::Other(name) => tracing::warn!(
-            seq = row.seq,
+            hand_over = hand_over.id,
             state = %name,
-            "Meka reports an item state this build does not know; leaving the message as it is"
+            "Meka reports an item state this build does not know; leaving the messages as they are"
         ),
     }
 }
@@ -1611,17 +1630,17 @@ async fn settle_replayed(context: &SessionContext, row: &QueuedMessage, receipt:
 /// The feed's replay and a reconnect's reconciliation settle these in the ordinary way, and neither
 /// happens on a connection that stays up for days. What is left is the hand-over whose outcome
 /// reached this bridge and was not written down: a store error inside `apply` is logged and nothing
-/// re-drives it, the feed position moves past the event, and Meka never sends it again. Its message
-/// would sit with Meka for as long as the connection lasts, counting against the queue depth and
-/// reaching nobody.
+/// re-drives it, the feed position moves past the event, and Meka never sends it again. Its
+/// messages would sit with Meka for as long as the connection lasts, counting against the queue
+/// depth and reaching nobody.
 ///
 /// An item Meka tried and kept failing is given up on by the `retry_until` Meka answered its post
 /// with, so one past that has had its outcome. One never tried is still waiting for a turn, which
-/// asking will not hurry, and costs a request each sweep until it gets one. A row posted before the
-/// deadline was written down is judged by `hand_over_within`, Meka's default ceiling. Rate-limited
-/// by `[bridge].straggler_sweep`, and normally over an empty list.
+/// asking will not hurry, and costs a request each sweep until it gets one. A hand-over posted
+/// before the deadline was written down is judged by `hand_over_within`, Meka's default ceiling.
+/// Rate-limited by `[bridge].straggler_sweep`, and normally over an empty list.
 async fn settle_stragglers(context: &SessionContext, session_id: Uuid) {
-    let posted = match context.store.rows_in(QueueState::Posted).await {
+    let posted = match context.store.hand_overs_in(QueueState::Posted).await {
         Ok(posted) => posted,
         Err(error) => {
             tracing::error!("could not read what Meka has: {}", error);
@@ -1631,18 +1650,18 @@ async fn settle_stragglers(context: &SessionContext, session_id: Uuid) {
     let now = Utc::now();
     let within =
         chrono::Duration::from_std(context.config.bridge.hand_over_within).unwrap_or_default();
-    for row in posted {
-        let deadline = row
+    for hand_over in posted {
+        let deadline = hand_over
             .retry_until
-            .or_else(|| row.posted_at.map(|posted| posted + within));
+            .or_else(|| hand_over.posted_at.map(|posted| posted + within));
         if deadline.is_none_or(|deadline| deadline > now) {
             continue;
         }
         tracing::warn!(
-            seq = row.seq,
-            "Meka has had a message longer than an outcome can take; asking what became of it"
+            hand_over = hand_over.id,
+            "Meka has had messages longer than an outcome can take; asking what became of them"
         );
-        ask_about(context, session_id, &row).await;
+        ask_about(context, session_id, &hand_over).await;
     }
 }
 
@@ -1652,50 +1671,54 @@ async fn settle_stragglers(context: &SessionContext, session_id: Uuid) {
 /// one request and changes nothing on its side, which is cheaper than being sure no event was
 /// missed.
 async fn reconcile(context: &SessionContext, session_id: Uuid, before: DateTime<Utc>) {
-    let posted = match context.store.rows_in(QueueState::Posted).await {
+    let posted = match context.store.hand_overs_in(QueueState::Posted).await {
         Ok(posted) => posted,
         Err(error) => {
             tracing::error!("could not read what Meka has: {}", error);
             return;
         }
     };
-    for row in posted {
+    for hand_over in posted {
         // Handed over since the connection opened, so its outcome is on that connection and asking
         // would only spend a request to be told what is already on the way.
-        if row.posted_at.is_some_and(|posted| posted > before) {
+        if hand_over.posted_at.is_some_and(|posted| posted > before) {
             continue;
         }
-        ask_about(context, session_id, &row).await;
+        ask_about(context, session_id, &hand_over).await;
     }
 }
 
 /// Ask Meka what became of one hand-over, under the key it was made with.
-async fn ask_about(context: &SessionContext, session_id: Uuid, row: &QueuedMessage) {
-    if row.session_id != Some(session_id) {
+async fn ask_about(context: &SessionContext, session_id: Uuid, hand_over: &HandOver) {
+    if hand_over.session_id != session_id {
         // Nothing will ever report on it: its outcome would arrive on a feed for a session this
         // bridge no longer follows. A rebind closes these as it goes, so reaching one here means a
-        // rebind could not read them, and leaving it would strand its message with Meka for good.
+        // rebind could not read them, and leaving it would strand its messages with Meka for good.
         tracing::warn!(
-            seq = row.seq,
-            "a message was handed to a session this bridge no longer follows"
+            hand_over = hand_over.id,
+            "messages were handed to a session this bridge no longer follows"
         );
         fail(
             context,
-            row,
+            hand_over,
             "the session it was handed to is no longer this bridge's",
             Retry::Never,
         )
         .await;
         return;
     }
-    let (Some(key), Some(body)) = (row.key.as_deref(), row.body.as_deref()) else {
+    let Some(body) = hand_over.body.as_deref() else {
         tracing::error!(
-            seq = row.seq,
+            hand_over = hand_over.id,
             "Meka has an item this bridge kept no request for, so it cannot be asked about"
         );
         return;
     };
-    match context.meka.post_inbox(session_id, body, key).await {
+    match context
+        .meka
+        .post_inbox(session_id, body, &hand_over.key)
+        .await
+    {
         Ok(receipt) if !receipt.replayed => {
             // Meka has no record of the key, so the post just made is the hand-over now.
             //
@@ -1706,21 +1729,21 @@ async fn ask_about(context: &SessionContext, session_id: Uuid, row: &QueuedMessa
             // asks under a key Meka has forgotten. A Meka whose store was replaced has no session
             // either and answers 404, which rebinds rather than arriving here.
             //
-            // Either way the agent may read this message twice, and that is taken rather than
+            // Either way the agent may read these messages twice, and that is taken rather than
             // prevented. After a rotation the item made under the old token is still Meka's to
             // deliver, and withdrawing the copy just made would leave the old one's fate unknowable
-            // and its message owed back, which trades one kind of repetition for another. A swept
+            // and its messages owed back, which trades one kind of repetition for another. A swept
             // item was delivered unless it was withdrawn, and nothing left on Meka's side says
-            // which, so keeping the copy is the one way the message is not lost.
+            // which, so keeping the copy is the one way the messages are not lost.
             tracing::warn!(
-                seq = row.seq,
+                hand_over = hand_over.id,
                 item = %receipt.item_id,
-                "Meka had no record of a message it had accepted; it is handed over afresh"
+                "Meka had no record of messages it had accepted; they are handed over afresh"
             );
             if let Err(error) = context
                 .store
                 .posted(
-                    row.seq,
+                    hand_over.id,
                     session_id,
                     &receipt.item_id,
                     Utc::now(),
@@ -1728,30 +1751,34 @@ async fn ask_about(context: &SessionContext, session_id: Uuid, row: &QueuedMessa
                 )
                 .await
             {
-                tracing::error!(seq = row.seq, "failed to record a hand-over: {}", error);
+                tracing::error!(
+                    hand_over = hand_over.id,
+                    "failed to record a hand-over: {}",
+                    error
+                );
             }
         }
-        Ok(receipt) => settle_replayed(context, row, &receipt).await,
+        Ok(receipt) => settle_replayed(context, hand_over, &receipt).await,
         Err(error) => tracing::warn!(
-            seq = row.seq,
-            "could not ask Meka about a message ({}); it is asked about again later",
+            hand_over = hand_over.id,
+            "could not ask Meka about messages ({}); they are asked about again later",
             error
         ),
     }
 }
 
-/// The row Meka knows as `item_id`, or `None` with the reason logged.
-async fn row_for(context: &SessionContext, item_id: &str) -> Option<QueuedMessage> {
-    match context.store.row_by_item(item_id).await {
-        Ok(Some(row)) => Some(row),
+/// The hand-over Meka knows as `item_id`, or `None` with the reason logged.
+async fn hand_over_for(context: &SessionContext, item_id: &str) -> Option<HandOver> {
+    match context.store.hand_over_by_item(item_id).await {
+        Ok(Some(hand_over)) => Some(hand_over),
         Ok(None) => {
-            // Another client of the same session, or a message `queue clear` took out from under
-            // the hand-over. Nothing here to settle either way.
+            // Another client of the same session, a schedule's fire, or a hand-over `queue clear`
+            // took away. Nothing here to settle either way.
             tracing::debug!(item = %item_id, "the feed named an item this bridge did not hand over");
             None
         }
         Err(error) => {
-            tracing::error!(item = %item_id, "could not look up an item's message: {}", error);
+            tracing::error!(item = %item_id, "could not look up an item's messages: {}", error);
             None
         }
     }
@@ -1902,13 +1929,11 @@ async fn apply(
                     let mut conversations = BTreeSet::new();
                     let mut messages = 0;
                     for item_id in item_ids {
-                        let Some(row) = row_for(context, item_id).await else {
+                        let Some(hand_over) = hand_over_for(context, item_id).await else {
                             continue;
                         };
-                        messages += 1;
-                        if let Some(conversation) = ConversationId::parse(&row.conversation) {
-                            conversations.insert(conversation);
-                        }
+                        messages += hand_over.rows.len();
+                        conversations.extend(conversations_of(&hand_over.rows));
                     }
                     if *resumed {
                         tracing::debug!(
@@ -1941,8 +1966,8 @@ async fn apply(
                 TurnSource::Client => {
                     tracing::debug!(turn, "a turn somebody else submitted began");
                 }
-                TurnSource::Schedule { job_id } => {
-                    tracing::debug!(turn, job = %job_id, "a scheduled job fired");
+                TurnSource::Schedule { schedule_ids } => {
+                    tracing::debug!(turn, schedules = ?schedule_ids, "a schedule fired");
                 }
                 TurnSource::Background => {
                     tracing::debug!(turn, "a background outcome opened a turn");
@@ -1972,11 +1997,13 @@ async fn apply(
             false
         }
         TurnEvent::InboxDelivered { item_ids } => {
+            let mut ours = false;
             for item_id in item_ids {
-                let Some(row) = row_for(context, item_id).await else {
+                let Some(hand_over) = hand_over_for(context, item_id).await else {
                     continue;
                 };
-                deliver(context, &row).await;
+                ours = true;
+                deliver(context, &hand_over).await;
                 let Some(turn) = turn else {
                     continue;
                 };
@@ -1987,15 +2014,18 @@ async fn apply(
                 // nothing else carries it.
                 {
                     let tally = turns.entry(turn.to_string()).or_default();
-                    if !tally.read.contains(&row.seq) {
-                        tally.read.push(row.seq);
+                    for row in &hand_over.rows {
+                        if !tally.read.contains(&row.seq) {
+                            tally.read.push(row.seq);
+                        }
                     }
                 }
-                if let Some(conversation) = ConversationId::parse(&row.conversation) {
-                    typist.expect(turn, BTreeSet::from([conversation]));
-                }
+                typist.expect(turn, conversations_of(&hand_over.rows));
             }
-            if !item_ids.is_empty() && context.outage_reported.swap(false, Ordering::SeqCst) {
+            // Only this bridge's own items say its turns get through. A schedule's fire is an inbox
+            // item too, and one read while this bridge's messages wait out a retry says nothing
+            // about them.
+            if ours && context.outage_reported.swap(false, Ordering::SeqCst) {
                 tracing::info!("turns on this bridge's messages get through again");
                 if let Some(owner) = owner_of(context) {
                     notify(
@@ -2013,14 +2043,18 @@ async fn apply(
             reason,
             error,
         } => {
-            if let Some(row) = row_for(context, item_id).await {
+            if let Some(hand_over) = hand_over_for(context, item_id).await {
                 let problem = error
                     .clone()
                     .map(serde_json::from_value::<ProblemDetail>)
                     .and_then(Result::ok);
                 let reason = given_up_reason(reason, problem.as_ref());
-                tracing::error!(seq = row.seq, "Meka gave up on a message: {}", reason);
-                fail(context, &row, &reason, Retry::Undelivered).await;
+                tracing::error!(
+                    hand_over = hand_over.id,
+                    "Meka gave up on messages: {}",
+                    reason
+                );
+                fail(context, &hand_over, &reason, Retry::Undelivered).await;
             }
             false
         }
@@ -2034,10 +2068,10 @@ async fn apply(
             false
         }
         TurnEvent::InboxWithdrawn { item_id } => {
-            if let Some(row) = row_for(context, item_id).await {
+            if let Some(hand_over) = hand_over_for(context, item_id).await {
                 offer_again(
                     context,
-                    &row,
+                    hand_over.id,
                     "the turn that had opened on it was cancelled",
                     Some(context.config.bridge.retry_base),
                 )
@@ -2239,8 +2273,19 @@ async fn finish(
                     "the model returned an empty response and called no tools; offering its \
                      messages again"
                 );
-                for row in read_by(context, &tally).await {
-                    offer_again(context, &row, "the model returned an empty response", None).await;
+                let hand_overs: BTreeSet<i64> = read_by(context, &tally)
+                    .await
+                    .iter()
+                    .filter_map(|row| row.hand_over)
+                    .collect();
+                for hand_over in hand_overs {
+                    offer_again(
+                        context,
+                        hand_over,
+                        "the model returned an empty response",
+                        None,
+                    )
+                    .await;
                 }
                 return true;
             }
@@ -2706,15 +2751,24 @@ async fn deferred(
     error: &ProblemDetail,
 ) {
     let mut rows = Vec::with_capacity(item_ids.len());
+    let mut deadlines = Vec::new();
     for item_id in item_ids {
+        let Some(hand_over) = hand_over_for(context, item_id).await else {
+            continue;
+        };
         // Only what Meka still has. A deferral replayed after the bridge restarted can name a
-        // message whose fate the reconnect has settled since, and reporting it as still being
+        // hand-over whose fate the reconnect has settled since, and reporting it as still being
         // retried would be telling the owner about an outage that is over.
-        if let Some(row) = row_for(context, item_id).await
-            && row.state == QueueState::Posted
-        {
-            rows.push(row);
+        let waiting: Vec<QueuedMessage> = hand_over
+            .rows
+            .into_iter()
+            .filter(|row| row.state == QueueState::Posted)
+            .collect();
+        if waiting.is_empty() {
+            continue;
         }
+        rows.extend(waiting);
+        deadlines.extend(hand_over.retry_until);
     }
     if rows.is_empty() {
         return;
@@ -2753,7 +2807,7 @@ async fn deferred(
     // so the earliest deadline is the one that matters: it is when Meka starts giving up. Meka
     // stops at the last attempt that would land before it, which can be a few minutes sooner, so
     // it is a bound rather than a time.
-    match rows.iter().filter_map(|row| row.retry_until).min() {
+    match deadlines.into_iter().min() {
         Some(deadline) => text.push_str(&format!(
             " If it is still failing by {}, Meka starts giving up on them, and this bridge reports \
              each one undelivered as it does.",

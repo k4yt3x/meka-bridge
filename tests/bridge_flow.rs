@@ -41,7 +41,7 @@ use meka_bridge::{
     mcp::{OutboundSink, ViewedAttachment},
     meka::MekaClient,
     store::{
-        AccountId, AccountIdentity, ConversationRecord, HandOver, MessageKey, NewWatch, Policy,
+        AccountId, AccountIdentity, ConversationRecord, MessageKey, NewHandOver, NewWatch, Policy,
         QueueState, QueueStats, ReactionTarget, Store, WatchOutcome,
     },
     watch::{WatchField, WatchMode},
@@ -365,8 +365,8 @@ struct MekaRecorder {
     /// What each turn read, in the order the turns ran: the turn's id and the bodies of the items
     /// it was handed, including any appended after it started.
     ///
-    /// The batching assertion the suite actually cares about. One item per message is the contract
-    /// with Meka; one turn per burst is what it buys, and only the server can say whether it held.
+    /// Where a batching assertion can see what one turn was handed, items appended mid-turn
+    /// included.
     turns_read: Mutex<Vec<(String, Vec<String>)>>,
 }
 
@@ -706,9 +706,10 @@ fn quota_error() -> serde_json::Value {
 
 /// Meka's inbox drain: the turn everything waiting is read into, and what the feed says about it.
 ///
-/// One turn takes every item waiting for it, which is what makes a burst of messages cost one
-/// provider round trip rather than one each, and one that lands while a turn runs is appended to
-/// that turn rather than opening another. The bridge posts an item per message and relies on both.
+/// One turn takes every item waiting for it, and one that lands while a turn runs is appended to
+/// that turn rather than opening another. A Meka from 0.95 opens a turn on the items that woke it
+/// alone and reads the rest at its next pause, which is why the bridge hands a burst over as one
+/// item rather than relying on either.
 async fn run_turn(recorder: Arc<MekaRecorder>) {
     let script = *recorder
         .script
@@ -2368,7 +2369,7 @@ impl Harness {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The inbox items Meka accepted, in order, one per message.
+    /// The inbox items Meka accepted, in order, one per hand-over.
     fn items(&self) -> Vec<String> {
         self.recorder
             .items
@@ -2784,6 +2785,55 @@ async fn an_item_taken_back_before_the_model_read_it_is_offered_again() {
 }
 
 #[tokio::test]
+async fn every_message_an_item_carries_goes_where_the_item_goes() {
+    // One item for a pass means one fate for its messages, whichever chats they came from: taken
+    // back unread, they are offered again together, under a new key and beside whatever else has
+    // settled since; out of offers, every chat that lost one is told.
+    let harness = Harness::start_script_with(TurnScript::Withdraw, Setup {
+        max_offers: 1,
+        ..Setup::coalescing()
+    })
+    .await;
+    let first = message("are you there?", "1");
+    // Sent at the same instant, so both chats go quiet together and settle in one pass however
+    // slowly this test reaches the second send.
+    let sent_at = first.timestamp();
+    harness.sender.send(first).await.expect("queued");
+    let mut elsewhere = message("anyone?", "other-1");
+    if let InboundEvent::Message(inner) = &mut elsewhere {
+        inner.conversation = ConversationId::parse("mock:-100").expect("valid");
+        inner.timestamp = sent_at;
+    }
+    harness.sender.send(elsewhere).await.expect("queued");
+
+    harness
+        .wait_for_queue("the offers to run out", |stats| stats.failed == 2)
+        .await;
+    let items = harness.items();
+    assert_eq!(items.len(), 2, "one item, offered once more: {items:#?}");
+    for item in &items {
+        assert!(
+            item.contains("are you there?") && item.contains("anyone?"),
+            "both chats' messages travel in one item:\n{item}"
+        );
+    }
+    let keys = harness.keys();
+    assert_ne!(keys[0], keys[1], "a new hand-over is a new key: {keys:?}");
+    harness
+        .wait_for("every chat to be told", |harness| {
+            let told: Vec<String> = harness
+                .channel
+                .sent()
+                .into_iter()
+                .map(|(conversation, _)| conversation)
+                .collect();
+            told.iter().any(|conversation| conversation == "mock:1")
+                && told.iter().any(|conversation| conversation == "mock:-100")
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn a_turn_cancelled_after_the_model_read_a_batch_does_not_offer_it_again() {
     // The other half, and the reason the rule is not simply "cancelled means offer it again". The
     // model read the messages before the turn was stopped, so they are accounted for: a second run
@@ -3109,6 +3159,31 @@ async fn the_owner_told_of_an_outage_hears_when_it_is_over() {
         .next()
         .cloned()
         .expect("one item");
+    // A schedule's fire is an inbox item too, and one read while this bridge's message waits out
+    // its retry says nothing about that message.
+    let fire = harness.recorder.feed.next_id.load(Ordering::SeqCst);
+    harness.recorder.feed.push(
+        "inbox.delivered",
+        Some("t8"),
+        serde_json::json!({ "item_ids": ["a-schedule-s-fire"] }),
+    );
+    harness
+        .wait_until("the fire's delivery to be read", async |store| {
+            let Ok(Some(session)) = store.session_id().await else {
+                return false;
+            };
+            store
+                .feed_position(session)
+                .await
+                .is_ok_and(|position| position.is_some_and(|position| position >= fire))
+        })
+        .await;
+    assert_eq!(
+        owner_notices(&harness).len(),
+        1,
+        "an item this bridge did not hand over says nothing about its turns: {:?}",
+        owner_notices(&harness)
+    );
     harness.recorder.mark(&item, "delivered");
     harness.recorder.feed.push(
         "inbox.delivered",
@@ -3545,7 +3620,10 @@ async fn a_transient_refusal_is_recovered_by_the_next_post() {
 }
 
 #[tokio::test]
-async fn messages_that_arrive_together_are_batched_into_one_turn() {
+async fn messages_that_arrive_together_are_one_item_read_in_one_turn() {
+    // Which messages belong together is the bridge's to say, and only one item says it: Meka reads
+    // items as they reach it, so five posted back to back have the first open a turn on its own,
+    // and the agent can answer it before it has seen the other four.
     let harness = Harness::start_coalescing().await;
     for index in 0..5 {
         harness
@@ -3558,21 +3636,34 @@ async fn messages_that_arrive_together_are_batched_into_one_turn() {
     harness
         .wait_for("a turn", |harness| !harness.turns().is_empty())
         .await;
-    // Long enough for a second turn to open behind the first, had the batch been split.
+    // Long enough for a second item to land behind the first, had the burst been split.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
+    let items = harness.items();
     assert_eq!(
-        harness.items().len(),
-        5,
-        "every message is an item of its own, delivered exactly once"
+        items.len(),
+        1,
+        "five messages that settled together are one item: {items:#?}"
+    );
+    let order: Vec<usize> = (0..5)
+        .map(|index| {
+            items[0]
+                .find(&format!("part {index}"))
+                .expect("every message is in the item")
+        })
+        .collect();
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "oldest first:\n{}",
+        items[0]
     );
     let turns = harness.turns();
+    assert_eq!(turns.len(), 1, "and one turn reads it, got {turns:#?}");
     assert_eq!(
-        turns.len(),
-        1,
-        "five messages sent together belong in one turn, got {turns:#?}"
+        harness.store.queue_stats().await.expect("stats").done,
+        5,
+        "every message the item carried is delivered with it"
     );
-    assert_eq!(turns[0].len(), 5, "and that turn reads all five");
 }
 
 /// Whether one turn read an item carrying each of `texts`.
@@ -3619,15 +3710,13 @@ async fn a_chat_somebody_is_still_typing_in_waits_for_them() {
         .await
         .expect("queued");
     harness
-        .wait_for("the turn", |harness| {
-            harness.turns().first().is_some_and(|read| read.len() == 2)
-        })
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
         .await;
-    let turns = harness.turns();
+    let items = harness.items();
+    assert_eq!(items.len(), 1, "both messages are one item: {items:#?}");
     assert!(
-        read_all(&turns[0], &["hey", "deploy logs"]),
-        "both messages belong in one turn:\n{:#?}",
-        turns[0]
+        read_all(&items, &["hey", "deploy logs"]),
+        "both messages belong in one turn:\n{items:#?}"
     );
 }
 
@@ -3777,8 +3866,8 @@ async fn the_parts_of_one_split_post_arrive_together() {
     assert_eq!(
         turns[0]
             .iter()
-            .filter(|item| item.contains("album: album-1"))
-            .count(),
+            .map(|item| item.matches("album: album-1").count())
+            .sum::<usize>(),
         3,
         "every part of the post has to be in it:\n{:#?}",
         turns[0]
@@ -3923,18 +4012,88 @@ async fn a_chat_that_never_goes_quiet_is_released_by_the_ceiling() {
     });
 
     // settle_max is 600ms in the harness, so a turn has to happen well before the stream ends.
+    let carried = |read: &[String]| -> usize {
+        read.iter()
+            .map(|item| item.matches("\nchatter ").count())
+            .sum()
+    };
     harness
         .wait_for("a turn despite the stream", |harness| {
-            harness.turns().iter().any(|read| read.len() > 1)
+            harness.turns().iter().any(|read| carried(read) > 1)
         })
         .await;
     chatter.abort();
 
     let turns = harness.turns();
     assert!(
-        turns[0].len() > 1,
+        carried(&turns[0]) > 1,
         "the ceiling should still release what has piled up rather than one message, got:\n{:#?}",
         turns[0]
+    );
+}
+
+#[tokio::test]
+async fn a_claim_that_could_not_be_made_into_a_hand_over_goes_back_to_the_queue() {
+    // A hold that fails, and whose hand-back fails too, leaves its rows claimed and in no
+    // hand-over. Nothing posts them and nothing claims them, so short of a restart they would wait
+    // for ever; the next pass of the queue releases them instead.
+    //
+    // The floor holds the session task off a fresh message for two seconds, so the claim made here
+    // is this test's and nobody else's.
+    let harness = Harness::start_with_setup(Setup::coalescing()).await;
+    // Past the startup recovery, which releases such a row too and would pass this test without
+    // the pass of the queue ever doing it.
+    harness
+        .sender
+        .send(message("first", "0"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for_queue("the first message to be delivered", |stats| stats.done == 1)
+        .await;
+    harness
+        .store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    let account = mock_account(&harness.store).await;
+    let payload = serde_json::to_string(&message("stranded", "1")).expect("encodes");
+    harness
+        .store
+        .enqueue(
+            MessageKey {
+                conversation: "mock:1",
+                account,
+                message_id: "1",
+                revision: 0,
+            },
+            &payload,
+            Utc::now(),
+            64,
+        )
+        .await
+        .expect("enqueued");
+    let claimed = harness
+        .store
+        .claim(&["mock:1".to_string()], 10)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "the claim must be this test's");
+    assert_eq!(claimed[0].hand_over, None);
+
+    // A message of its own, so a pass of the queue comes round.
+    harness
+        .sender
+        .send(message("and this", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for_queue("every message to be delivered", |stats| stats.done == 3)
+        .await;
+    assert!(
+        harness.items().iter().any(|item| item.contains("stranded")),
+        "the stranded message reached the agent: {:?}",
+        harness.items()
     );
 }
 
@@ -6171,9 +6330,9 @@ async fn meka_being_unreachable_is_posted_again_rather_than_given_up_on() {
             "a post to be charged against the hand-over",
             async |store| {
                 store
-                    .rows_in(QueueState::InFlight)
+                    .hand_overs_in(QueueState::InFlight)
                     .await
-                    .is_ok_and(|rows| rows.iter().any(|row| row.posts > 0))
+                    .is_ok_and(|hand_overs| hand_overs.iter().any(|hand_over| hand_over.posts > 0))
             },
         )
         .await;
@@ -6827,7 +6986,7 @@ async fn the_agents_own_messages_are_never_a_backlog() {
 #[tokio::test]
 async fn a_file_the_agent_sent_can_be_opened_again() {
     // The case that matters is not the sending session, which still has the local path, but every
-    // other one: a file sent by a scheduled job is otherwise a history row nobody can open.
+    // other one: a file sent by a schedule's turn is otherwise a history row nobody can open.
     let (sink, channel, store) = own_message_harness().await;
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().join("chart.png");
@@ -8172,22 +8331,21 @@ async fn a_hand_over_meka_never_saw_is_posted_again_after_a_restart() {
             .expect("claimed");
         let seq = claimed.first().expect("a row was claimed").seq;
         let key = format!("meka-bridge-{}", uuid::Uuid::new_v4());
-        assert!(
-            store
-                .hold(
-                    seq,
-                    HandOver {
-                        key: &key,
-                        body: "rendered before the restart",
-                        session_id: uuid::Uuid::nil(),
-                        dropped: 0,
-                        accounted: None,
-                    },
-                    Utc::now(),
-                )
-                .await
-                .expect("held")
-        );
+        store
+            .hold(
+                NewHandOver {
+                    key: &key,
+                    body: "rendered before the restart",
+                    session_id: uuid::Uuid::nil(),
+                    rows: &[seq],
+                    dropped: 0,
+                    accounted: &[],
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("held")
+            .expect("a fresh claim takes its hand-over");
         key
     };
 
@@ -8882,10 +9040,9 @@ async fn a_backlog_is_stated_once_and_owed_back_if_its_item_dies() {
 
 #[tokio::test]
 async fn two_messages_in_one_pass_state_their_chat_s_backlog_once() {
-    // The other half of the accounting, and the half a single hand-over cannot show. A claimed pass
-    // renders an item per message, so two mentions that settle together are two items; the backlog
-    // belongs on the first of them and marking it seen there is what keeps the second from
-    // restating what the agent is already being shown in the same turn.
+    // A claimed pass is one item, so two mentions that settle together share it, and the chat's
+    // backlog is stated once, ahead of both: the agent reads the same three messages once, and the
+    // mute notice once.
     //
     // The two have to settle together for that, so the floor has to outlast a stalled writer
     // persisting them. At the default, a stall between the two releases the first alone, and the
@@ -8916,32 +9073,32 @@ async fn two_messages_in_one_pass_state_their_chat_s_backlog_once() {
         .await
         .expect("queued");
     harness
-        .wait_for("both items", |harness| harness.items().len() >= 2)
+        .wait_for("the item", |harness| {
+            harness.items().iter().any(|item| item.contains("@bot two"))
+        })
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let items = harness.items();
-    assert_eq!(items.len(), 2, "one item per message: {items:#?}");
-    assert!(
-        items[0].contains("3 messages you have not seen") && items[0].contains("chatter 2"),
-        "the first item of the chat states its backlog:\n{}",
-        items[0]
+    assert_eq!(items.len(), 1, "one item for the pass: {items:#?}");
+    let item = &items[0];
+    assert_eq!(
+        item.matches("3 messages you have not seen").count(),
+        1,
+        "the chat's backlog is stated once:\n{item}"
     );
-    assert!(
-        !items[1].contains("you have not seen") && !items[1].contains("chatter 2"),
-        "the second states it again, so the agent reads the same three messages twice in one \
-         turn:\n{}",
-        items[1]
+    assert_eq!(
+        item.matches("only woken in mock:1").count(),
+        1,
+        "and the mute notice once:\n{item}"
     );
-    // Nor the empty version of the block. Once the first item has marked the backlog seen, asking
-    // again answers "nothing since you last looked", which is true and worth nothing: the agent is
-    // reading both items in the same turn and was told about the chat a few lines above.
+    let backlog = item.find("chatter 2").expect("the backlog is stated");
+    let first = item.find("@bot one").expect("the first mention is in it");
+    let second = item.find("@bot two").expect("the second mention is in it");
     assert!(
-        !items[1].contains("only woken in mock:1"),
-        "the second item repeats the mute notice the first one just gave:\n{}",
-        items[1]
+        backlog < first && first < second,
+        "what the chat owes comes ahead of its messages, oldest first:\n{item}"
     );
-    assert!(items[1].contains("@bot two"), "got:\n{}", items[1]);
     assert_eq!(
         harness
             .store

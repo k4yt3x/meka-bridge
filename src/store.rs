@@ -61,6 +61,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_013.sql"),
     include_str!("store/schema_014.sql"),
     include_str!("store/schema_015.sql"),
+    include_str!("store/schema_016.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -564,12 +565,7 @@ pub struct RecordedReactions {
     pub counts: Vec<(ReactionEmoji, u64)>,
 }
 
-/// A message waiting to be handed to the agent, and, once claimed, the hand-over it became.
-///
-/// One row is one inbox item. It outlives the request that posts it, so a retry after an ambiguous
-/// failure, or after a restart on either side, posts the same [`Self::key`] and the same
-/// [`Self::body`], and Meka answers with the item it already made and that item's current state,
-/// which is also how a hand-over whose feed events were missed is reconciled.
+/// A message waiting to be handed to the agent, and, once claimed, the message a hand-over carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedMessage {
     pub seq: i64,
@@ -581,31 +577,55 @@ pub struct QueuedMessage {
     pub payload: String,
     pub received_at: DateTime<Utc>,
     pub state: QueueState,
-    /// The `Idempotency-Key` the item is posted under, minted once when the row is held.
-    pub key: Option<String>,
-    /// The rendered item, byte for byte. Dropped once the row reaches [`QueueState::Failed`],
-    /// where it would only be a second copy of [`Self::payload`] that nothing will ever post.
-    pub body: Option<String>,
-    /// The Meka session the item is, or will be, posted to.
-    pub session_id: Option<Uuid>,
-    /// Meka's id for the item, from the 202.
-    pub item_id: Option<String>,
-    /// The dropped-message count this item reported, owed back if the item never delivers.
-    pub dropped: u64,
+    /// The hand-over carrying it: the current one while it is in flight or with Meka, and the last
+    /// one once it is closed. `None` while it waits to be claimed, and on a claimed row nothing
+    /// was rendered for yet.
+    pub hand_over: Option<i64>,
     /// Hand-overs this row has been part of.
     pub attempts: u32,
-    /// Posts made of the current item, successful or not.
-    pub posts: u32,
-    /// When the row may be claimed again, while it is pending, or posted again, while it is in
-    /// flight.
+    /// When the row may be claimed again, while it is pending.
     pub not_before: Option<DateTime<Utc>>,
+    /// Why the last hand-over carrying it came apart, or why it failed.
+    pub last_error: Option<String>,
+}
+
+/// One inbox item, and the messages it carries.
+///
+/// Every message that settled together goes in one item, because which of them belong together is
+/// the bridge's to say and only one item says it: items posted one after another reach Meka one
+/// after another, and the first opens a turn on its own. The hand-over outlives the request that
+/// posts it, so a retry after an ambiguous failure, or after a restart on either side, posts the
+/// same [`Self::key`] and the same [`Self::body`], and Meka answers with the item it already made
+/// and that item's current state, which is also how a hand-over whose feed events were missed is
+/// reconciled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandOver {
+    pub id: i64,
+    /// The `Idempotency-Key` the item is posted under, minted once when the hand-over is made.
+    pub key: String,
+    /// The rendered item, byte for byte. Dropped once nothing will post it again, where it would
+    /// only be a second copy of its messages.
+    pub body: Option<String>,
+    /// The Meka session the item is, or will be, posted to.
+    pub session_id: Uuid,
+    /// Meka's id for the item, from the 202.
+    pub item_id: Option<String>,
+    /// The dropped-message count the item reported, owed back if the item never delivers.
+    pub dropped: u64,
+    /// Posts made of the item, successful or not.
+    pub posts: u32,
+    /// When the item may be posted again, after a post that did not go through.
+    pub not_before: Option<DateTime<Utc>>,
+    /// Why the last post did not go through.
     pub last_error: Option<String>,
     /// When the item was rendered.
-    pub held_at: Option<DateTime<Utc>>,
+    pub held_at: DateTime<Utc>,
     /// When Meka accepted it.
     pub posted_at: Option<DateTime<Utc>>,
     /// When Meka stops retrying the item, as its answer to the post said.
     pub retry_until: Option<DateTime<Utc>>,
+    /// The messages it carries, oldest first. One offered again leaves it.
+    pub rows: Vec<QueuedMessage>,
 }
 
 impl QueuedMessage {
@@ -722,32 +742,35 @@ impl QueueState {
     }
 }
 
-/// What became of a row offered again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Offer {
-    /// Back in the queue, for a hand-over of its own under a new key.
-    Retrying,
-    /// Out of offers, and now `failed`. This is what an operator needs to hear about: the agent was
-    /// never handed it, and nothing will hand it over now.
-    Exhausted(Box<Undelivered>),
-    /// Something else had already closed it, so nothing changed.
-    Closed,
+/// What became of a hand-over's messages offered again.
+///
+/// Both empty when something else had already closed them, so nothing changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reoffer {
+    /// Back in the queue, for a hand-over of their own under a new key.
+    pub retrying: Vec<QueuedMessage>,
+    /// Out of offers, and now `failed`. This is what an operator needs to hear about: the agent
+    /// was never handed them, and nothing will hand them over now.
+    pub exhausted: Vec<Undelivered>,
 }
 
-/// A rendered item, and what it takes with it when its row is held.
+/// A rendered item, and what it takes with it when its hand-over is made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandOver<'a> {
+pub struct NewHandOver<'a> {
     /// The `Idempotency-Key` it is posted under, minted once and never again, so every post of
-    /// this row is the same request to Meka.
+    /// the item is the same request to Meka.
     pub key: &'a str,
     /// The rendered item, byte for byte. Meka refuses the same key with other words.
     pub body: &'a str,
     /// The Meka session it is, or will be, posted to. Meka scopes keys per session.
     pub session_id: Uuid,
+    /// The claimed rows whose messages it carries.
+    pub rows: &'a [i64],
     /// The dropped-message count it states, which comes off the counter as it is stored.
     pub dropped: u64,
-    /// The conversation backlog it states, on the item stating one.
-    pub accounted: Option<Backlog>,
+    /// The conversation backlogs it states, each against the row of that conversation it states
+    /// it beside.
+    pub accounted: &'a [(i64, Backlog)],
 }
 
 /// One conversation's backlog as an item reported it: the two bounds that describe exactly what
@@ -764,11 +787,11 @@ pub struct Backlog {
 /// What a restart found in the queue.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Recovered {
-    /// Rows claimed but never rendered, returned to `pending`.
+    /// Rows claimed but never made into a hand-over, returned to `pending`.
     pub orphaned: usize,
-    /// Rows Meka never accepted, which are posted again under their own key.
+    /// Rows in a hand-over Meka never accepted, which is posted again under its own key.
     pub unposted: usize,
-    /// Rows Meka has, whose fate the feed's replay or a reconciliation settles.
+    /// Rows in a hand-over Meka has, whose fate the feed's replay or a reconciliation settles.
     pub posted: usize,
 }
 
@@ -2042,9 +2065,8 @@ impl Store {
     /// restart) cannot hand the same message over twice.
     ///
     /// One pass may span conversations, which is what makes several chats that all became ready
-    /// together reach the agent in one turn rather than one each: Meka reads every item waiting for
-    /// it into the turn it opens. `ready` narrows which are eligible, not how many may be claimed
-    /// at once.
+    /// together one inbox item, read by the agent at once rather than one chat after another.
+    /// `ready` narrows which are eligible, not how many may be claimed at once.
     pub async fn claim(&self, ready: &[String], limit: usize) -> Result<Vec<QueuedMessage>> {
         // SQLite does accept `IN ()` and evaluates it false, so this is for the round trip rather
         // than for correctness: nothing being ready is by far the most common tick, and there is no
@@ -2118,8 +2140,8 @@ impl Store {
     ///
     /// For a payload this build cannot decode, which will never become readable and would otherwise
     /// wedge the queue behind it for ever. Guarded on nothing having been rendered yet, like
-    /// [`Self::unclaim`]: once a key is minted, Meka may hold the item under it, and only the
-    /// hand-over's own outcome may close the row.
+    /// [`Self::unclaim`]: once a row is in a hand-over, Meka may hold the item under its key, and
+    /// only the hand-over's own outcome may close the row.
     pub async fn complete(&self, sequences: &[i64]) -> Result<()> {
         let sequences = sequences.to_vec();
         let completed_at = to_rfc3339(Utc::now());
@@ -2131,7 +2153,7 @@ impl Store {
                     transaction.execute(
                         "UPDATE inbound_queue
                          SET state = 'done', last_error = NULL, completed_at = ?2
-                         WHERE seq = ?1 AND state = 'in_flight' AND key IS NULL",
+                         WHERE seq = ?1 AND state = 'in_flight' AND hand_over_id IS NULL",
                         rusqlite::params![sequence, &completed_at],
                     )?;
                 }
@@ -2149,9 +2171,9 @@ impl Store {
     /// store errors exhaust the offer budget and declare a message undeliverable that was never
     /// even attempted.
     ///
-    /// A row with a key is refused. Its item exists under that key, so Meka may already hold it,
-    /// and putting the row back would hand the same message over twice; [`Self::reoffer`] is what
-    /// takes a rendered row back, and it sheds the key on the way.
+    /// A row in a hand-over is refused. Its item exists under the hand-over's key, so Meka may
+    /// already hold it, and putting the row back would hand the same message over twice;
+    /// [`Self::reoffer`] is what takes a rendered row back, and it leaves the hand-over on the way.
     pub async fn unclaim(&self, sequences: &[i64]) -> Result<()> {
         let sequences = sequences.to_vec();
         self.connection
@@ -2161,7 +2183,7 @@ impl Store {
                 for sequence in sequences {
                     transaction.execute(
                         "UPDATE inbound_queue SET state = 'pending'
-                         WHERE seq = ?1 AND state = 'in_flight' AND key IS NULL",
+                         WHERE seq = ?1 AND state = 'in_flight' AND hand_over_id IS NULL",
                         [sequence],
                     )?;
                 }
@@ -2172,41 +2194,55 @@ impl Store {
         Ok(())
     }
 
-    /// Stamp a rendered item onto a claimed row, and take off what the item states only once.
+    /// Make a hand-over of claimed rows, storing the item rendered for them and taking off what it
+    /// states only once.
     ///
     /// One transaction, because the writes describe one fact. The key is minted here and never
-    /// again, so every post of this row is the same request to Meka. The dropped-message count the
+    /// again, so every post of the item is the same request to Meka. The dropped-message count the
     /// item reported comes off the counter in the same write, so a crash between rendering and this
-    /// call loses the item and keeps the count rather than the reverse. And the backlog the item
-    /// states is marked seen here, stamped with this row's `seq`, which is what lets a second
-    /// hand-over be outstanding for the same conversation without restating what the first one
-    /// already said, and lets a hand-over that dies give back exactly the slice it took.
+    /// call loses the item and keeps the count rather than the reverse. And each backlog the item
+    /// states is marked seen here, stamped with the `seq` of the row it is stated beside, which is
+    /// what lets a second hand-over be outstanding for the same conversation without restating what
+    /// the first one already said, and lets a hand-over that dies give back exactly the slice it
+    /// took.
     ///
-    /// `false` when the row was not a fresh claim any more, which nothing here acts on further.
-    pub async fn hold(&self, seq: i64, item: HandOver<'_>, at: DateTime<Utc>) -> Result<bool> {
+    /// `None`, with nothing written, when a row was not a fresh claim any more, which nothing here
+    /// acts on further.
+    pub async fn hold(&self, item: NewHandOver<'_>, at: DateTime<Utc>) -> Result<Option<i64>> {
         let key = item.key.to_string();
         let body = item.body.to_string();
         let session = item.session_id.to_string();
+        let rows = item.rows.to_vec();
         let dropped_count = i64::try_from(item.dropped).unwrap_or(i64::MAX);
         let held_at = to_rfc3339(at);
-        let accounted = item
+        let accounted: Vec<(i64, i64, String)> = item
             .accounted
-            .map(|backlog| (backlog.watermark, to_rfc3339(backlog.through)));
+            .iter()
+            .map(|(seq, backlog)| (*seq, backlog.watermark, to_rfc3339(backlog.through)))
+            .collect();
         let held = self
             .connection
             .call(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let changed = transaction.execute(
-                    "UPDATE inbound_queue
-                     SET key = ?2, body = ?3, session_id = ?4, dropped = ?5, held_at = ?6,
-                         posts = 0, not_before = NULL, last_error = NULL
-                     WHERE seq = ?1 AND state = 'in_flight' AND key IS NULL",
-                    rusqlite::params![seq, key, body, session, dropped_count, held_at],
+                transaction.execute(
+                    "INSERT INTO hand_overs (key, body, session_id, dropped, held_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![key, body, session, dropped_count, held_at],
                 )?;
-                if changed == 0 {
-                    transaction.commit()?;
-                    return Ok(false);
+                let id = transaction.last_insert_rowid();
+                let mut attached = 0;
+                for seq in &rows {
+                    attached += transaction.execute(
+                        "UPDATE inbound_queue
+                         SET hand_over_id = ?2, not_before = NULL, last_error = NULL
+                         WHERE seq = ?1 AND state = 'in_flight' AND hand_over_id IS NULL",
+                        rusqlite::params![seq, id],
+                    )?;
+                }
+                if rows.is_empty() || attached != rows.len() {
+                    transaction.rollback()?;
+                    return Ok(None);
                 }
                 if dropped_count > 0 {
                     // Clamped at zero. The counter can only have moved up since it was read, and a
@@ -2218,7 +2254,7 @@ impl Store {
                         rusqlite::params![dropped_count, META_DROPPED],
                     )?;
                 }
-                if let Some((watermark, through)) = accounted {
+                for (seq, watermark, through) in &accounted {
                     // Both bounds together are the set `take_unseen` counted, and neither alone is.
                     // On the timestamp alone, a row written between the count and this call at or
                     // below the ceiling is marked without ever being shown, which is not a narrow
@@ -2234,21 +2270,21 @@ impl Store {
                     )?;
                 }
                 transaction.commit()?;
-                Ok(true)
+                Ok(Some(id))
             })
             .await?;
         Ok(held)
     }
 
-    /// Record that Meka has the row's item, on `session_id`.
+    /// Record that Meka has the hand-over's item, on `session_id`.
     ///
-    /// Accepted on a row already posted as well as on one waiting: a reconciliation that finds Meka
-    /// with no record of the item posts it afresh, and the new id is the one the feed will name.
-    /// The session is written because a row held before a rebind is posted to the session the
-    /// bridge has now.
+    /// Accepted on a hand-over already posted as well as on one waiting: a reconciliation that
+    /// finds Meka with no record of the item posts it afresh, and the new id is the one the feed
+    /// will name. The session is written because a hand-over made before a rebind is posted to the
+    /// session the bridge has now. Nothing is written for a hand-over something else has closed.
     pub async fn posted(
         &self,
-        seq: i64,
+        hand_over: i64,
         session_id: Uuid,
         item_id: &str,
         at: DateTime<Utc>,
@@ -2260,14 +2296,23 @@ impl Store {
         let retry_until = retry_until.map(to_rfc3339);
         self.connection
             .call(move |connection| {
-                connection.execute(
-                    "UPDATE inbound_queue
-                     SET state = 'posted', session_id = ?2, item_id = ?3, posted_at = ?4,
-                         posts = posts + 1, not_before = NULL, last_error = NULL,
-                         retry_until = ?5
-                     WHERE seq = ?1 AND state IN ('in_flight', 'posted')",
-                    rusqlite::params![seq, session_id, item_id, at, retry_until],
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let open = transaction.execute(
+                    "UPDATE inbound_queue SET state = 'posted'
+                     WHERE hand_over_id = ?1 AND state IN ('in_flight', 'posted')",
+                    [hand_over],
                 )?;
+                if open > 0 {
+                    transaction.execute(
+                        "UPDATE hand_overs
+                         SET session_id = ?2, item_id = ?3, posted_at = ?4, posts = posts + 1,
+                             not_before = NULL, last_error = NULL, retry_until = ?5
+                         WHERE id = ?1",
+                        rusqlite::params![hand_over, session_id, item_id, at, retry_until],
+                    )?;
+                }
+                transaction.commit()?;
                 Ok(())
             })
             .await?;
@@ -2275,16 +2320,23 @@ impl Store {
     }
 
     /// Record that a post did not go through, and when it may be made again.
-    pub async fn defer(&self, seq: i64, error: &str, not_before: DateTime<Utc>) -> Result<()> {
+    pub async fn defer(
+        &self,
+        hand_over: i64,
+        error: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<()> {
         let error = error.to_string();
         let not_before = to_rfc3339(not_before);
         self.connection
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE inbound_queue
+                    "UPDATE hand_overs
                      SET posts = posts + 1, last_error = ?2, not_before = ?3
-                     WHERE seq = ?1 AND state = 'in_flight'",
-                    rusqlite::params![seq, error, not_before],
+                     WHERE id = ?1
+                       AND EXISTS (SELECT 1 FROM inbound_queue
+                                   WHERE hand_over_id = ?1 AND state = 'in_flight')",
+                    rusqlite::params![hand_over, error, not_before],
                 )?;
                 Ok(())
             })
@@ -2292,11 +2344,11 @@ impl Store {
         Ok(())
     }
 
-    /// Close a row the model has read.
+    /// Close a hand-over the model has read.
     ///
-    /// `false` for a row already closed: the feed replays an outcome after a reconnect, and the
+    /// `false` for one already closed: the feed replays an outcome after a reconnect, and the
     /// second reading must change nothing.
-    pub async fn delivered(&self, seq: i64, at: DateTime<Utc>) -> Result<bool> {
+    pub async fn delivered(&self, hand_over: i64, at: DateTime<Utc>) -> Result<bool> {
         let at = to_rfc3339(at);
         let closed = self
             .connection
@@ -2304,69 +2356,80 @@ impl Store {
                 connection.execute(
                     "UPDATE inbound_queue
                      SET state = 'done', last_error = NULL, completed_at = ?2
-                     WHERE seq = ?1 AND state IN ('in_flight', 'posted')",
-                    rusqlite::params![seq, at],
+                     WHERE hand_over_id = ?1 AND state IN ('in_flight', 'posted')",
+                    rusqlite::params![hand_over, at],
                 )
             })
             .await?;
         Ok(closed > 0)
     }
 
-    /// Close a row that will never reach the model, give back what its item had taken, and put its
-    /// message back among what the agent is owed.
+    /// Close a hand-over that will never reach the model, give back what its item had taken, and
+    /// put its messages back among what the agent is owed.
     ///
-    /// Returns the row so the caller can say who lost what, and nothing for a row something else
-    /// had already closed. The rendered body goes, since nothing will ever post it again and
-    /// keeping it would pin a second copy of somebody's message for the life of the database; the
+    /// Returns its messages so the caller can say who lost what, and none for a hand-over something
+    /// else had already closed. The rendered body goes, since nothing will ever post it again and
+    /// keeping it would pin a second copy of somebody's messages for the life of the database; the
     /// key and the item id stay, because they are what names this hand-over in Meka's own logs.
     pub async fn failed(
         &self,
-        seq: i64,
+        hand_over: i64,
         error: &str,
         at: DateTime<Utc>,
-    ) -> Result<Option<Undelivered>> {
+    ) -> Result<Vec<Undelivered>> {
         let error = error.to_string();
         let at = to_rfc3339(at);
-        let row = self
+        let closed = self
             .connection
             .call(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let closed = transaction.execute(
-                    "UPDATE inbound_queue
-                     SET state = 'failed', body = NULL, last_error = ?2, completed_at = ?3
-                     WHERE seq = ?1 AND state IN ('in_flight', 'posted')",
-                    rusqlite::params![seq, error, at],
-                )?;
-                if closed == 0 {
+                let open = open_rows(&transaction, hand_over, &["in_flight", "posted"])?;
+                if open.is_empty() {
                     transaction.commit()?;
-                    return Ok(None);
+                    return Ok(Vec::new());
                 }
-                restore(&transaction, seq)?;
-                let owed = unsee(&transaction, seq)?;
-                let row = read_row(&transaction, seq)?;
+                restore(&transaction, hand_over)?;
+                transaction.execute(
+                    "UPDATE inbound_queue
+                     SET state = 'failed', last_error = ?2, completed_at = ?3
+                     WHERE hand_over_id = ?1 AND state IN ('in_flight', 'posted')",
+                    rusqlite::params![hand_over, error, at],
+                )?;
+                transaction.execute("UPDATE hand_overs SET body = NULL WHERE id = ?1", [
+                    hand_over,
+                ])?;
+                let mut closed = Vec::with_capacity(open.len());
+                for seq in open {
+                    let owed = unsee(&transaction, seq)?;
+                    if let Some(row) = read_row(&transaction, seq)? {
+                        closed.push(Undelivered { row, owed });
+                    }
+                }
                 transaction.commit()?;
-                Ok(row.map(|row| Undelivered { row, owed }))
+                Ok(closed)
             })
             .await?;
-        Ok(row)
+        Ok(closed)
     }
 
-    /// Offer a row again, spending one of its offers.
+    /// Offer a hand-over's messages again, spending one of each one's offers.
     ///
-    /// For the two ways a hand-over comes apart without the message having been answered: Meka took
-    /// the item back before the model read it, and the model read it and came back with nothing at
-    /// all, no text and no tool call. Either way the row goes back to `pending`, held until
-    /// `not_before` when one is given, and the next claim renders it afresh under a new key. A row
-    /// past `max_offers` fails instead and comes back so the caller can say so.
+    /// For the two ways a hand-over comes apart without its messages having been answered: Meka
+    /// took the item back before the model read it, and the model read it and came back with
+    /// nothing at all, no text and no tool call. Either way each message goes back to `pending`,
+    /// held until `not_before` when one is given, and leaves the hand-over: the next claim renders
+    /// it afresh, beside whatever else has settled, under a new key. One past `max_offers` fails
+    /// instead and comes back so the caller can say so. A hand-over all of whose messages went
+    /// back is deleted, since nothing names it any more.
     pub async fn reoffer(
         &self,
-        seq: i64,
+        hand_over: i64,
         error: &str,
         max_offers: u32,
         not_before: Option<DateTime<Utc>>,
         at: DateTime<Utc>,
-    ) -> Result<Offer> {
+    ) -> Result<Reoffer> {
         let error = error.to_string();
         let not_before = not_before.map(to_rfc3339);
         let at = to_rfc3339(at);
@@ -2375,44 +2438,56 @@ impl Store {
             .call(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let changed = transaction.execute(
-                    "UPDATE inbound_queue SET attempts = attempts + 1, last_error = ?2
-                     WHERE seq = ?1 AND state IN ('in_flight', 'posted', 'done')",
-                    rusqlite::params![seq, error],
-                )?;
-                if changed == 0 {
+                let open = open_rows(&transaction, hand_over, &["in_flight", "posted", "done"])?;
+                if open.is_empty() {
                     transaction.commit()?;
-                    return Ok(Offer::Closed);
+                    return Ok(Reoffer::default());
                 }
-                restore(&transaction, seq)?;
-                let attempts: u32 = transaction.query_row(
-                    "SELECT attempts FROM inbound_queue WHERE seq = ?1",
-                    [seq],
-                    |row| row.get(0),
-                )?;
-                if attempts > max_offers {
+                restore(&transaction, hand_over)?;
+                let mut offer = Reoffer::default();
+                for seq in open {
                     transaction.execute(
-                        "UPDATE inbound_queue
-                         SET state = 'failed', body = NULL, completed_at = ?2
+                        "UPDATE inbound_queue SET attempts = attempts + 1, last_error = ?2
                          WHERE seq = ?1",
-                        rusqlite::params![seq, at],
+                        rusqlite::params![seq, error],
                     )?;
-                    let owed = unsee(&transaction, seq)?;
-                    let row = read_row(&transaction, seq)?;
-                    transaction.commit()?;
-                    return Ok(row.map_or(Offer::Closed, |row| {
-                        Offer::Exhausted(Box::new(Undelivered { row, owed }))
-                    }));
+                    let attempts: u32 = transaction.query_row(
+                        "SELECT attempts FROM inbound_queue WHERE seq = ?1",
+                        [seq],
+                        |row| row.get(0),
+                    )?;
+                    if attempts > max_offers {
+                        transaction.execute(
+                            "UPDATE inbound_queue SET state = 'failed', completed_at = ?2
+                             WHERE seq = ?1",
+                            rusqlite::params![seq, at],
+                        )?;
+                        let owed = unsee(&transaction, seq)?;
+                        if let Some(row) = read_row(&transaction, seq)? {
+                            offer.exhausted.push(Undelivered { row, owed });
+                        }
+                    } else {
+                        transaction.execute(
+                            "UPDATE inbound_queue
+                             SET state = 'pending', not_before = ?2, hand_over_id = NULL,
+                                 completed_at = NULL
+                             WHERE seq = ?1",
+                            rusqlite::params![seq, not_before],
+                        )?;
+                        if let Some(row) = read_row(&transaction, seq)? {
+                            offer.retrying.push(row);
+                        }
+                    }
                 }
-                transaction.execute(
-                    &format!(
-                        "UPDATE inbound_queue SET state = 'pending', not_before = ?2, {QUEUE_CLEARED}
-                         WHERE seq = ?1"
-                    ),
-                    rusqlite::params![seq, not_before],
-                )?;
+                if offer.exhausted.is_empty() {
+                    transaction.execute("DELETE FROM hand_overs WHERE id = ?1", [hand_over])?;
+                } else {
+                    transaction.execute("UPDATE hand_overs SET body = NULL WHERE id = ?1", [
+                        hand_over,
+                    ])?;
+                }
                 transaction.commit()?;
-                Ok(Offer::Retrying)
+                Ok(offer)
             })
             .await?;
         Ok(offer)
@@ -2452,57 +2527,78 @@ impl Store {
         Ok(rows)
     }
 
-    /// The row Meka knows as `item_id`, if any.
-    pub async fn row_by_item(&self, item_id: &str) -> Result<Option<QueuedMessage>> {
-        let item_id = item_id.to_string();
-        let row = self
+    /// One hand-over by id, with the messages it carries.
+    pub async fn hand_over(&self, id: i64) -> Result<Option<HandOver>> {
+        let hand_over = self
             .connection
-            .call(move |connection| {
-                connection
-                    .query_row(
-                        &format!("SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.item_id = ?1"),
-                        [item_id],
-                        row_to_queued,
-                    )
-                    .optional()
-            })
+            .call(move |connection| read_hand_over(connection, id))
             .await?;
-        Ok(row)
+        Ok(hand_over)
     }
 
-    /// Every row in `state`, oldest first.
-    pub async fn rows_in(&self, state: QueueState) -> Result<Vec<QueuedMessage>> {
-        let rows = self
+    /// The hand-over Meka knows as `item_id`, if any.
+    pub async fn hand_over_by_item(&self, item_id: &str) -> Result<Option<HandOver>> {
+        let item_id = item_id.to_string();
+        let hand_over = self
             .connection
             .call(move |connection| {
-                let mut statement = connection.prepare(&format!(
-                    "SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.state = ?1 ORDER BY q.seq"
-                ))?;
-                let rows = statement.query_map([state.as_str()], row_to_queued)?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
+                let id: Option<i64> = connection
+                    .query_row(
+                        "SELECT id FROM hand_overs WHERE item_id = ?1",
+                        [item_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match id {
+                    Some(id) => read_hand_over(connection, id),
+                    None => Ok(None),
+                }
             })
             .await?;
-        Ok(rows)
+        Ok(hand_over)
+    }
+
+    /// Every hand-over whose messages are in `state`, oldest first.
+    pub async fn hand_overs_in(&self, state: QueueState) -> Result<Vec<HandOver>> {
+        let hand_overs = self
+            .connection
+            .call(move |connection| {
+                let ids: Vec<i64> = {
+                    let mut statement = connection.prepare(
+                        "SELECT hand_over_id FROM inbound_queue
+                         WHERE state = ?1 AND hand_over_id IS NOT NULL
+                         GROUP BY hand_over_id
+                         ORDER BY min(seq)",
+                    )?;
+                    let ids = statement.query_map([state.as_str()], |row| row.get(0))?;
+                    ids.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let mut hand_overs = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(hand_over) = read_hand_over(connection, id)? {
+                        hand_overs.push(hand_over);
+                    }
+                }
+                Ok(hand_overs)
+            })
+            .await?;
+        Ok(hand_overs)
     }
 
     /// Put the queue back the way a restart needs it, and say what was found. Called once at
     /// startup.
     ///
     /// Only rows claimed and never rendered move: the process died between the claim and
-    /// [`Self::hold`], so nothing was rendered for them and nothing reached Meka. A row that was
-    /// rendered is left where it is, since it is either posted again under its own key or asked
-    /// about, and either answer is better than a guess.
+    /// [`Self::hold`], so nothing was rendered for them and nothing reached Meka. A row in a
+    /// hand-over is left where it is, since the hand-over is either posted again under its own key
+    /// or asked about, and either answer is better than a guess.
     pub async fn recover(&self) -> Result<Recovered> {
         let recovered = self
             .connection
             .call(|connection| {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let orphaned = transaction.execute(
-                    "UPDATE inbound_queue SET state = 'pending'
-                     WHERE state = 'in_flight' AND key IS NULL",
-                    [],
-                )?;
+                let orphaned = release_unrendered(&transaction)?;
                 let count = |state: QueueState| -> rusqlite::Result<usize> {
                     transaction
                         .query_row(
@@ -2523,6 +2619,19 @@ impl Store {
             })
             .await?;
         Ok(recovered)
+    }
+
+    /// Return to the queue every claimed row in no hand-over, and say how many there were.
+    ///
+    /// The session task makes every claim into a hand-over before it claims again, so such a row is
+    /// one whose hand-over could not be stored and which could not be handed back either. Nothing
+    /// was made for it and Meka has nothing, so offering it again is free.
+    pub async fn release_unrendered(&self) -> Result<usize> {
+        let released = self
+            .connection
+            .call(|connection| release_unrendered(connection))
+            .await?;
+        Ok(released)
     }
 
     pub async fn pending_count(&self) -> Result<u64> {
@@ -2583,15 +2692,17 @@ impl Store {
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let outstanding: Vec<i64> = {
                     let mut statement = transaction.prepare(
-                        "SELECT seq FROM inbound_queue WHERE state IN ('in_flight', 'posted')",
+                        "SELECT DISTINCT hand_over_id FROM inbound_queue
+                         WHERE state IN ('in_flight', 'posted') AND hand_over_id IS NOT NULL",
                     )?;
                     let rows = statement.query_map([], |row| row.get(0))?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                for seq in outstanding {
-                    restore(&transaction, seq)?;
+                for hand_over in outstanding {
+                    restore(&transaction, hand_over)?;
                 }
                 let deleted = transaction.execute("DELETE FROM inbound_queue", [])?;
+                transaction.execute("DELETE FROM hand_overs", [])?;
                 transaction.commit()?;
                 Ok(deleted)
             })
@@ -2602,21 +2713,32 @@ impl Store {
     /// Drop delivered rows older than `before`.
     ///
     /// Completed rows are kept for a window rather than deleted immediately because they are what
-    /// makes duplicate detection work across a restart. Going takes the rendered item with them,
-    /// which is the copy of somebody's message worth not keeping; a row that ends `failed` had its
-    /// body dropped when it failed, so it costs nothing to keep for the operator to find.
+    /// makes duplicate detection work across a restart. A hand-over goes with the last of its rows,
+    /// taking the rendered item with it, which is the copy of somebody's messages worth not
+    /// keeping; a hand-over whose messages failed had its body dropped when they did, so it costs
+    /// nothing to keep for the operator to find.
     pub async fn prune_delivered(&self, before: DateTime<Utc>) -> Result<usize> {
         let before = to_rfc3339(before);
         let deleted = self
             .connection
             .call(move |connection| {
-                connection.execute(
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let deleted = transaction.execute(
                     // `coalesce` so rows written before `completed_at` existed keep their old
                     // behaviour rather than becoming immortal.
                     "DELETE FROM inbound_queue
                      WHERE state = 'done' AND coalesce(completed_at, received_at) < ?1",
                     [&before],
-                )
+                )?;
+                transaction.execute(
+                    "DELETE FROM hand_overs
+                     WHERE NOT EXISTS (SELECT 1 FROM inbound_queue q
+                                       WHERE q.hand_over_id = hand_overs.id)",
+                    [],
+                )?;
+                transaction.commit()?;
+                Ok(deleted)
             })
             .await?;
         Ok(deleted)
@@ -2981,7 +3103,7 @@ impl Store {
     /// The unseen pair shares `MESSAGE_CURRENT` rather than spelling that rule out again; writing
     /// the third by hand is how it came to disagree with the contract on [`UnseenSummary::marker`]
     /// without anything saying so. The third is what a watcher polls, so its filter decides when a
-    /// scheduled job wakes. Own messages are excluded or the agent replying moves the marker,
+    /// schedule fires. Own messages are excluded or the agent replying moves the marker,
     /// firing the watcher on a room whose only new message the agent wrote itself. Retracted rows
     /// are excluded because a deletion moving the marker back is news, which used to happen by
     /// itself when the row was removed and now has to be said explicitly.
@@ -3783,18 +3905,13 @@ const CONVERSATION_ID_OF_2: &str = "(SELECT id FROM conversations WHERE address 
 
 /// The columns [`row_to_queued`] reads, over [`QUEUE_FROM`].
 const QUEUE_COLUMNS: &str = "q.seq, c.address, q.account_id, q.message_id, q.revision, q.payload,
-     q.received_at, q.state, q.key, q.body, q.session_id, q.item_id, q.dropped, q.attempts,
-     q.posts, q.not_before, q.last_error, q.held_at, q.posted_at, q.retry_until";
+     q.received_at, q.state, q.hand_over_id, q.attempts, q.not_before, q.last_error";
 
 const QUEUE_FROM: &str = "inbound_queue q JOIN conversations c ON c.id = q.conversation_id";
 
-/// Everything a row sheds when it goes back to the queue for a hand-over of its own.
-///
-/// `last_error` is deliberately not in it: why the last offer came apart is the one thing worth
-/// still being able to read on a row that is waiting to be tried again.
-const QUEUE_CLEARED: &str = "key = NULL, body = NULL, session_id = NULL, item_id = NULL,
-     dropped = 0, posts = 0, held_at = NULL, posted_at = NULL, completed_at = NULL,
-     retry_until = NULL";
+/// The columns [`row_to_hand_over`] reads, in the order it reads them, over `hand_overs h`.
+const HAND_OVER_COLUMNS: &str = "h.id, h.key, h.body, h.session_id, h.item_id, h.dropped, h.posts,
+     h.not_before, h.last_error, h.held_at, h.posted_at, h.retry_until";
 
 /// The columns [`row_to_message`] reads, in the order it reads them, over [`MESSAGE_FROM`].
 ///
@@ -4102,11 +4219,7 @@ fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
 fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
     let received_at: String = row.get(6)?;
     let state: String = row.get(7)?;
-    let session_id: Option<String> = row.get(10)?;
-    let not_before: Option<String> = row.get(15)?;
-    let held_at: Option<String> = row.get(17)?;
-    let posted_at: Option<String> = row.get(18)?;
-    let retry_until: Option<String> = row.get(19)?;
+    let not_before: Option<String> = row.get(10)?;
     Ok(QueuedMessage {
         seq: row.get(0)?,
         conversation: row.get(1)?,
@@ -4124,23 +4237,89 @@ fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
                 ),
             )
         })?,
-        key: row.get(8)?,
-        body: row.get(9)?,
-        session_id: session_id
-            .as_deref()
-            .map(Uuid::parse_str)
-            .transpose()
-            .map_err(|error| corrupt_column(10, error))?,
-        item_id: row.get(11)?,
-        dropped: row.get::<_, i64>(12)?.max(0) as u64,
-        attempts: row.get(13)?,
-        posts: row.get(14)?,
+        hand_over: row.get(8)?,
+        attempts: row.get(9)?,
         not_before: not_before.as_deref().map(parse_rfc3339).transpose()?,
-        last_error: row.get(16)?,
-        held_at: held_at.as_deref().map(parse_rfc3339).transpose()?,
+        last_error: row.get(11)?,
+    })
+}
+
+/// A hand-over as [`HAND_OVER_COLUMNS`] reads it, before its rows are read.
+fn row_to_hand_over(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandOver> {
+    let session_id: String = row.get(3)?;
+    let not_before: Option<String> = row.get(7)?;
+    let held_at: String = row.get(9)?;
+    let posted_at: Option<String> = row.get(10)?;
+    let retry_until: Option<String> = row.get(11)?;
+    Ok(HandOver {
+        id: row.get(0)?,
+        key: row.get(1)?,
+        body: row.get(2)?,
+        session_id: Uuid::parse_str(&session_id).map_err(|error| corrupt_column(3, error))?,
+        item_id: row.get(4)?,
+        dropped: row.get::<_, i64>(5)?.max(0) as u64,
+        posts: row.get(6)?,
+        not_before: not_before.as_deref().map(parse_rfc3339).transpose()?,
+        last_error: row.get(8)?,
+        held_at: parse_rfc3339(&held_at)?,
         posted_at: posted_at.as_deref().map(parse_rfc3339).transpose()?,
         retry_until: retry_until.as_deref().map(parse_rfc3339).transpose()?,
+        rows: Vec::new(),
     })
+}
+
+/// One hand-over by id, with the rows it carries, on a connection or a transaction already in
+/// hand.
+fn read_hand_over(
+    connection: &rusqlite::Connection,
+    id: i64,
+) -> rusqlite::Result<Option<HandOver>> {
+    let Some(mut hand_over) = connection
+        .query_row(
+            &format!("SELECT {HAND_OVER_COLUMNS} FROM hand_overs h WHERE h.id = ?1"),
+            [id],
+            row_to_hand_over,
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.hand_over_id = ?1 ORDER BY q.seq"
+    ))?;
+    let rows = statement.query_map([id], row_to_queued)?;
+    hand_over.rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(hand_over))
+}
+
+/// Put every claimed row in no hand-over back in the queue, on a connection or a transaction
+/// already in hand.
+fn release_unrendered(connection: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE inbound_queue SET state = 'pending'
+         WHERE state = 'in_flight' AND hand_over_id IS NULL",
+        [],
+    )
+}
+
+/// The rows of `hand_over` in one of `states`, oldest first.
+fn open_rows(
+    connection: &rusqlite::Connection,
+    hand_over: i64,
+    states: &[&str],
+) -> rusqlite::Result<Vec<i64>> {
+    let placeholders = std::iter::repeat_n("?", states.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = connection.prepare(&format!(
+        "SELECT seq FROM inbound_queue
+         WHERE hand_over_id = ? AND state IN ({placeholders})
+         ORDER BY seq"
+    ))?;
+    let mut values: Vec<&dyn ToSql> = vec![&hand_over];
+    values.extend(states.iter().map(|state| state as &dyn ToSql));
+    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| row.get(0))?;
+    rows.collect()
 }
 
 /// One row by sequence, on a connection or a transaction already in hand.
@@ -4157,23 +4336,24 @@ fn read_row(
         .optional()
 }
 
-/// Give back everything the hand-over at `seq` took when it was rendered.
+/// Give back everything the hand-over took when it was rendered.
 ///
-/// The dropped-message count goes back on the counter, so the next item reports it; the backlog it
+/// The dropped-message count goes back on the counter, so the next item reports it; each backlog it
 /// stated goes back among what the agent is owed, exactly and only the rows it named, which is what
 /// `accounted_by` is for. Both are idempotent against a second call only because every caller
 /// guards on the state transition that precedes it.
-fn restore(connection: &rusqlite::Connection, seq: i64) -> rusqlite::Result<()> {
+fn restore(connection: &rusqlite::Connection, hand_over: i64) -> rusqlite::Result<()> {
     connection.execute(
         "UPDATE meta
          SET value = CAST(CAST(value AS INTEGER)
-                          + (SELECT dropped FROM inbound_queue WHERE seq = ?1) AS TEXT)
-         WHERE key = ?2 AND (SELECT dropped FROM inbound_queue WHERE seq = ?1) > 0",
-        rusqlite::params![seq, META_DROPPED],
+                          + (SELECT dropped FROM hand_overs WHERE id = ?1) AS TEXT)
+         WHERE key = ?2 AND (SELECT dropped FROM hand_overs WHERE id = ?1) > 0",
+        rusqlite::params![hand_over, META_DROPPED],
     )?;
     connection.execute(
-        "UPDATE messages SET seen = 0, accounted_by = NULL WHERE accounted_by = ?1",
-        [seq],
+        "UPDATE messages SET seen = 0, accounted_by = NULL
+         WHERE accounted_by IN (SELECT seq FROM inbound_queue WHERE hand_over_id = ?1)",
+        [hand_over],
     )?;
     Ok(())
 }
@@ -4313,12 +4493,12 @@ mod tests {
         }
     }
 
-    /// Render claimed rows into hand-overs with nothing to say beyond their bodies.
+    /// Render each claimed row into a hand-over of its own, with nothing to say beyond its body.
     async fn hold_all(store: &Store, rows: &[QueuedMessage]) -> Vec<QueuedMessage> {
         hold_reporting(store, rows, 0, None).await
     }
 
-    /// The same, with the first row carrying a dropped count and a backlog.
+    /// The same, with the first row's item carrying a dropped count and a backlog.
     async fn hold_reporting(
         store: &Store,
         rows: &[QueuedMessage],
@@ -4329,29 +4509,39 @@ mod tests {
         for (index, row) in rows.iter().enumerate() {
             let first = index == 0;
             let key = format!("key-{}-{}", row.seq, row.attempts);
-            assert!(
-                store
-                    .hold(
-                        row.seq,
-                        HandOver {
-                            key: &key,
-                            body: "body",
-                            session_id: Uuid::nil(),
-                            dropped: if first { dropped } else { 0 },
-                            accounted: first.then_some(backlog).flatten(),
-                        },
-                        now(),
-                    )
-                    .await
-                    .expect("hold"),
-                "a claimed row must take its hand-over"
-            );
+            let accounted: Vec<(i64, Backlog)> = first
+                .then_some(backlog)
+                .flatten()
+                .map(|backlog| (row.seq, backlog))
+                .into_iter()
+                .collect();
+            store
+                .hold(
+                    NewHandOver {
+                        key: &key,
+                        body: "body",
+                        session_id: Uuid::nil(),
+                        rows: std::slice::from_ref(&row.seq),
+                        dropped: if first { dropped } else { 0 },
+                        accounted: &accounted,
+                    },
+                    now(),
+                )
+                .await
+                .expect("hold")
+                .expect("a claimed row must take its hand-over");
             held.push(store.row(row.seq).await.expect("read").expect("row"));
         }
         held
     }
 
-    /// Enqueue one message and hand it over, which is what `accounted_by` hangs off.
+    /// The hand-over a held row is in.
+    fn hand_over_of(row: &QueuedMessage) -> i64 {
+        row.hand_over.expect("the row is in a hand-over")
+    }
+
+    /// Enqueue one message and hand it over, which is what `accounted_by` hangs off. Returns the
+    /// held row.
     ///
     /// The queue row is synthetic: it carries no history of its own, so what it accounts for is
     /// exactly the backlog handed in.
@@ -4361,7 +4551,7 @@ mod tests {
         conversation: &str,
         message_id: &str,
         backlog: Option<Backlog>,
-    ) -> i64 {
+    ) -> QueuedMessage {
         store
             .enqueue(key(account, conversation, message_id), "{}", now(), 1_000)
             .await
@@ -4374,8 +4564,9 @@ mod tests {
             .iter()
             .find(|row| row.message_id == message_id)
             .expect("the row just enqueued was claimed");
-        hold_reporting(store, std::slice::from_ref(row), 0, backlog).await;
-        row.seq
+        hold_reporting(store, std::slice::from_ref(row), 0, backlog)
+            .await
+            .remove(0)
     }
 
     /// Claim from every conversation with something waiting.
@@ -6152,7 +6343,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_agents_own_message_does_not_move_the_watcher_marker() {
-        // The marker is what a scheduled job polls to decide whether a chat is worth a turn. Once
+        // The marker is what a schedule's gate polls to decide whether a chat is worth a turn. Once
         // the bridge started recording its own output, the agent replying moved it, so a watcher
         // fired on the main session having spoken and spent a turn reading a room whose only new
         // message was the agent's own. Nothing was recorded here before, which is why the marker
@@ -6707,12 +6898,13 @@ mod tests {
         // And the budget is still intact for a genuine offer afterwards.
         let claimed = claim_all(&store, 10).await;
         let held = hold_all(&store, &claimed).await;
+        let offer = store
+            .reoffer(hand_over_of(&held[0]), "withdrawn", 1, None, now())
+            .await
+            .expect("reoffer");
         assert_eq!(
-            store
-                .reoffer(held[0].seq, "withdrawn", 1, None, now())
-                .await
-                .expect("reoffer"),
-            Offer::Retrying,
+            (offer.retrying.len(), offer.exhausted.len()),
+            (1, 0),
             "the first real offer puts it back"
         );
         assert_eq!(store.queue_stats().await.expect("stats").failed, 0);
@@ -6727,29 +6919,44 @@ mod tests {
             .expect("enqueue");
         let claimed = claim_all(&store, 10).await;
         let held = hold_all(&store, &claimed).await;
-        let seq = held[0].seq;
+        let first_key = store
+            .hand_over(hand_over_of(&held[0]))
+            .await
+            .expect("read")
+            .expect("on file")
+            .key;
 
-        assert_eq!(
-            store
-                .reoffer(seq, "withdrawn", 1, None, now())
-                .await
-                .expect("reoffer"),
-            Offer::Retrying
-        );
+        let offer = store
+            .reoffer(hand_over_of(&held[0]), "withdrawn", 1, None, now())
+            .await
+            .expect("reoffer");
+        assert_eq!(offer.retrying.len(), 1);
         assert_eq!(store.pending_count().await.expect("count"), 1);
+        assert_eq!(
+            store.hand_over(hand_over_of(&held[0])).await.expect("read"),
+            None,
+            "a hand-over all of whose messages went back names nothing any more"
+        );
 
         let claimed = claim_all(&store, 10).await;
         assert_eq!(claimed[0].attempts, 1);
         let again = hold_all(&store, &claimed).await;
+        let second_key = store
+            .hand_over(hand_over_of(&again[0]))
+            .await
+            .expect("read")
+            .expect("on file")
+            .key;
         assert_ne!(
-            again[0].key, held[0].key,
+            second_key, first_key,
             "a hand-over of its own is a key of its own"
         );
         let second = store
-            .reoffer(seq, "withdrawn", 1, None, now())
+            .reoffer(hand_over_of(&again[0]), "withdrawn", 1, None, now())
             .await
             .expect("reoffer");
-        let Offer::Exhausted(exhausted) = second else {
+        assert!(second.retrying.is_empty(), "{second:?}");
+        let [exhausted] = second.exhausted.as_slice() else {
             panic!("the second offer runs it out: {second:?}");
         };
         assert_eq!(exhausted.row.conversation, "telegram:123");
@@ -6771,7 +6978,13 @@ mod tests {
 
         let retry_at = now() + chrono::Duration::seconds(30);
         store
-            .reoffer(held[0].seq, "withdrawn", 3, Some(retry_at), now())
+            .reoffer(
+                hand_over_of(&held[0]),
+                "withdrawn",
+                3,
+                Some(retry_at),
+                now(),
+            )
             .await
             .expect("reoffer");
 
@@ -6794,7 +7007,13 @@ mod tests {
         let held = hold_all(&store, &claimed).await;
         let retry_at = now() + chrono::Duration::seconds(30);
         store
-            .reoffer(held[0].seq, "withdrawn", 3, Some(retry_at), now())
+            .reoffer(
+                hand_over_of(&held[0]),
+                "withdrawn",
+                3,
+                Some(retry_at),
+                now(),
+            )
             .await
             .expect("reoffer");
 
@@ -6843,10 +7062,10 @@ mod tests {
         let held = hold_all(&store, &claimed).await;
 
         let offer = store
-            .reoffer(held[0].seq, "boom", 0, None, now())
+            .reoffer(hand_over_of(&held[0]), "boom", 0, None, now())
             .await
             .expect("reoffer");
-        let Offer::Exhausted(exhausted) = offer else {
+        let [exhausted] = offer.exhausted.as_slice() else {
             panic!("zero offers runs it out: {offer:?}");
         };
         assert!(exhausted.owed);
@@ -6857,10 +7076,12 @@ mod tests {
         );
 
         let failed = store
-            .failed(held[1].seq, "gone", now())
+            .failed(hand_over_of(&held[1]), "gone", now())
             .await
-            .expect("fail")
-            .expect("the row it closed comes back");
+            .expect("fail");
+        let [failed] = failed.as_slice() else {
+            panic!("the row it closed comes back: {failed:?}");
+        };
         assert!(failed.owed);
         assert_eq!(
             owed().await,
@@ -6878,13 +7099,15 @@ mod tests {
             .expect("enqueue");
         let claimed = claim_all(&store, 10).await;
         let held = hold_all(&store, &claimed).await;
-        assert!(matches!(
-            store
-                .reoffer(held[0].seq, "boom", 0, None, now())
-                .await
-                .expect("reoffer"),
-            Offer::Exhausted(_)
-        ));
+        let offer = store
+            .reoffer(hand_over_of(&held[0]), "boom", 0, None, now())
+            .await
+            .expect("reoffer");
+        assert_eq!(
+            (offer.retrying.len(), offer.exhausted.len()),
+            (0, 1),
+            "{offer:?}"
+        );
     }
 
     #[tokio::test]
@@ -6920,7 +7143,7 @@ mod tests {
         assert_eq!(rendered.message_id, "a");
 
         store
-            .posted(held[0].seq, Uuid::nil(), "item-1", now(), None)
+            .posted(hand_over_of(&held[0]), Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
         let recovered = store.recover().await.expect("recover");
@@ -6963,11 +7186,19 @@ mod tests {
         // One more shed while the item was being rendered, which the next item reports.
         store.note_dropped(1).await.expect("note");
         let held = hold_reporting(&store, &claimed, 5, None).await;
-        assert_eq!(held[0].dropped, 5);
+        assert_eq!(
+            store
+                .hand_over(hand_over_of(&held[0]))
+                .await
+                .expect("read")
+                .expect("on file")
+                .dropped,
+            5
+        );
         assert_eq!(store.peek_dropped().await.expect("peek"), 1);
         // And the item failing gives it back.
         store
-            .failed(held[0].seq, "gone", now())
+            .failed(hand_over_of(&held[0]), "gone", now())
             .await
             .expect("fail");
         assert_eq!(store.peek_dropped().await.expect("peek"), 6);
@@ -7091,7 +7322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_row_carries_its_own_key_and_what_its_item_stated() {
+    async fn a_hand_over_carries_its_messages_its_key_and_what_its_item_stated() {
         let (store, account) = seeded(&["telegram:123", "telegram:456"]).await;
         for (conversation, id) in [("telegram:123", "a"), ("telegram:456", "b")] {
             store
@@ -7101,28 +7332,41 @@ mod tests {
         }
         let claimed = claim_all(&store, 10).await;
         let session = Uuid::new_v4();
-        let first = claimed[0].seq;
-        let item = HandOver {
+        let rows: Vec<i64> = claimed.iter().map(|row| row.seq).collect();
+        let item = NewHandOver {
             key: "meka-bridge-1",
             body: "body",
             session_id: session,
+            rows: &rows,
             dropped: 0,
-            accounted: None,
+            accounted: &[],
         };
-        assert!(store.hold(first, item, now()).await.expect("hold"));
-        let held = store.row(first).await.expect("read").expect("on file");
-        assert_eq!(held.state, QueueState::InFlight);
-        assert_eq!(held.key.as_deref(), Some("meka-bridge-1"));
+        let id = store
+            .hold(item, now())
+            .await
+            .expect("hold")
+            .expect("both rows were fresh claims");
+        let held = store.hand_over(id).await.expect("read").expect("on file");
+        assert_eq!(held.key, "meka-bridge-1");
         assert_eq!(held.body.as_deref(), Some("body"));
-        assert_eq!(held.session_id, Some(session));
-        assert_eq!(held.held_at, Some(now()));
-        // A second render of the same row is refused: the key it would post under is already
-        // minted, and a row with two keys is two items to Meka.
+        assert_eq!(held.session_id, session);
+        assert_eq!(held.held_at, now());
+        assert_eq!(
+            held.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            rows,
+            "one item carries every message of the pass"
+        );
         assert!(
-            !store
+            held.rows
+                .iter()
+                .all(|row| row.state == QueueState::InFlight && row.hand_over == Some(id))
+        );
+        // A second render of the same rows is refused, and writes nothing: the key they would be
+        // posted under is already minted, and a message in two items is handed over twice.
+        assert_eq!(
+            store
                 .hold(
-                    first,
-                    HandOver {
+                    NewHandOver {
                         key: "meka-bridge-2",
                         body: "other",
                         ..item
@@ -7130,56 +7374,63 @@ mod tests {
                     now()
                 )
                 .await
-                .expect("hold")
+                .expect("hold"),
+            None
         );
-
-        let stats = store.queue_stats().await.expect("stats");
-        assert_eq!((stats.in_flight, stats.posted), (2, 0));
         assert_eq!(
             store
-                .rows_in(QueueState::InFlight)
+                .hand_overs_in(QueueState::InFlight)
                 .await
                 .expect("list")
-                .len(),
-            2
+                .iter()
+                .map(|hand_over| hand_over.id)
+                .collect::<Vec<_>>(),
+            vec![id]
         );
 
-        // A post that did not go through is written down with its wait.
+        // A post that did not go through is written down with its wait, on the hand-over.
         let later = now() + chrono::Duration::seconds(10);
         store
-            .defer(first, "connection refused", later)
+            .defer(id, "connection refused", later)
             .await
             .expect("defer");
-        let deferred = store.row(first).await.expect("read").expect("present");
+        let deferred = store.hand_over(id).await.expect("read").expect("present");
         assert_eq!(deferred.posts, 1);
-        assert_eq!(deferred.attempts, 0, "a failed post is not a spent offer");
         assert_eq!(deferred.not_before, Some(later));
         assert_eq!(deferred.last_error.as_deref(), Some("connection refused"));
+        assert!(
+            deferred.rows.iter().all(|row| row.attempts == 0),
+            "a failed post is not a spent offer"
+        );
 
-        // And the 202 moves it on, clearing what the failed post left.
+        // And the 202 moves every message on, clearing what the failed post left.
         store
-            .posted(first, session, "item-9", now(), None)
+            .posted(id, session, "item-9", now(), None)
             .await
             .expect("post");
-        let posted = store.row(first).await.expect("read").expect("present");
-        assert_eq!(posted.state, QueueState::Posted);
-        assert_eq!(posted.item_id.as_deref(), Some("item-9"));
+        let posted = store
+            .hand_over_by_item("item-9")
+            .await
+            .expect("read")
+            .expect("the feed names items, so a hand-over has to be found by one");
+        assert_eq!(posted.id, id);
         assert_eq!(posted.posts, 2);
         assert_eq!(posted.posted_at, Some(now()));
         assert_eq!(posted.not_before, None);
         assert_eq!(posted.last_error, None);
-        assert_eq!(
-            store.row_by_item("item-9").await.expect("read"),
-            Some(posted),
-            "the feed names items, so a row has to be found by one"
+        assert!(
+            posted
+                .rows
+                .iter()
+                .all(|row| row.state == QueueState::Posted)
         );
-        assert_eq!(store.row_by_item("nobody").await.expect("read"), None);
+        assert_eq!(store.hand_over_by_item("nobody").await.expect("read"), None);
         let stats = store.queue_stats().await.expect("stats");
-        assert_eq!((stats.in_flight, stats.posted), (1, 1));
+        assert_eq!((stats.in_flight, stats.posted), (0, 2));
     }
 
     #[tokio::test]
-    async fn delivering_a_row_closes_it_once() {
+    async fn delivering_a_hand_over_closes_it_once() {
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
@@ -7187,30 +7438,30 @@ mod tests {
             .expect("enqueue");
         let claimed = claim_all(&store, 10).await;
         let held = hold_all(&store, &claimed).await;
-        let seq = held[0].seq;
+        let id = hand_over_of(&held[0]);
         store
-            .posted(seq, Uuid::nil(), "item-1", now(), None)
+            .posted(id, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
 
-        assert!(store.delivered(seq, now()).await.expect("deliver"));
+        assert!(store.delivered(id, now()).await.expect("deliver"));
         let stats = store.queue_stats().await.expect("stats");
         assert_eq!((stats.done, stats.in_flight, stats.posted), (1, 0, 0));
         // The feed replays an outcome after a reconnect, and the second reading changes nothing.
-        assert!(!store.delivered(seq, now()).await.expect("deliver"));
+        assert!(!store.delivered(id, now()).await.expect("deliver"));
         assert!(
             store
-                .failed(seq, "late withdrawal", now())
+                .failed(id, "late withdrawal", now())
                 .await
                 .expect("fail")
-                .is_none(),
-            "a delivered row is not reopened by a later event"
+                .is_empty(),
+            "a delivered hand-over is not reopened by a later event"
         );
         assert_eq!(store.queue_stats().await.expect("stats").done, 1);
     }
 
     #[tokio::test]
-    async fn a_delivered_row_can_be_offered_again_when_the_model_said_nothing() {
+    async fn a_delivered_hand_over_can_be_offered_again_when_the_model_said_nothing() {
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
@@ -7218,88 +7469,106 @@ mod tests {
             .expect("enqueue");
         let claimed = claim_all(&store, 10).await;
         let held = hold_all(&store, &claimed).await;
-        let seq = held[0].seq;
+        let id = hand_over_of(&held[0]);
         store
-            .posted(seq, Uuid::nil(), "item-1", now(), None)
+            .posted(id, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
-        store.delivered(seq, now()).await.expect("deliver");
+        store.delivered(id, now()).await.expect("deliver");
 
-        assert_eq!(
-            store
-                .reoffer(seq, "empty response", 1, None, now())
-                .await
-                .expect("reoffer"),
-            Offer::Retrying
-        );
+        let offer = store
+            .reoffer(id, "empty response", 1, None, now())
+            .await
+            .expect("reoffer");
+        assert_eq!(offer.retrying.len(), 1);
         let again = claim_all(&store, 10).await;
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].attempts, 1);
         assert_eq!(
-            (again[0].key.as_deref(), again[0].item_id.as_deref()),
-            (None, None),
-            "a row offered again sheds the hand-over that came apart"
+            again[0].hand_over, None,
+            "a row offered again leaves the hand-over that came apart"
         );
         assert_eq!(
             again[0].last_error.as_deref(),
             Some("empty response"),
             "and keeps why, which is the one thing worth reading on a row waiting to be tried again"
         );
-        // A row still pending is not this function's to touch.
-        store.unclaim(&[seq]).await.expect("unclaim");
+        // A hand-over it has left is not this function's to touch again.
+        store.unclaim(&[again[0].seq]).await.expect("unclaim");
         assert_eq!(
             store
-                .reoffer(seq, "empty response", 1, None, now())
+                .reoffer(id, "empty response", 1, None, now())
                 .await
                 .expect("reoffer"),
-            Offer::Closed
+            Reoffer::default()
         );
         assert_eq!(store.queue_stats().await.expect("stats").pending, 1);
     }
 
     #[tokio::test]
-    async fn failing_a_row_closes_it_and_hands_it_back() {
-        let (store, account) = seeded(&["telegram:123"]).await;
-        store
-            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
-            .await
-            .expect("enqueue");
+    async fn failing_a_hand_over_closes_every_message_and_hands_them_back() {
+        let (store, account) = seeded(&["telegram:123", "telegram:456"]).await;
+        for (conversation, id) in [("telegram:123", "a"), ("telegram:456", "b")] {
+            store
+                .enqueue(key(account, conversation, id), id, now(), 10)
+                .await
+                .expect("enqueue");
+        }
         let claimed = claim_all(&store, 10).await;
-        let held = hold_all(&store, &claimed).await;
-        let seq = held[0].seq;
-
-        let Undelivered { row: closed, owed } = store
-            .failed(seq, "no turn could deliver it", now())
+        let rows: Vec<i64> = claimed.iter().map(|row| row.seq).collect();
+        let id = store
+            .hold(
+                NewHandOver {
+                    key: "meka-bridge-1",
+                    body: "body",
+                    session_id: Uuid::nil(),
+                    rows: &rows,
+                    dropped: 0,
+                    accounted: &[],
+                },
+                now(),
+            )
             .await
-            .expect("fail")
-            .expect("the row it closed comes back");
-        assert!(
-            !owed,
-            "nothing was recorded for it, so there is nothing to put back"
-        );
-        assert_eq!(closed.message_id, "a");
-        assert_eq!(closed.state, QueueState::Failed);
+            .expect("hold")
+            .expect("held");
+
+        let closed = store
+            .failed(id, "no turn could deliver it", now())
+            .await
+            .expect("fail");
         assert_eq!(
-            closed.last_error.as_deref(),
-            Some("no turn could deliver it")
+            closed
+                .iter()
+                .map(|closed| closed.row.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "every message the item carried is closed with it"
+        );
+        for Undelivered { row, owed } in &closed {
+            assert!(
+                !owed,
+                "nothing was recorded for it, so there is nothing to put back"
+            );
+            assert_eq!(row.state, QueueState::Failed);
+            assert_eq!(row.last_error.as_deref(), Some("no turn could deliver it"));
+        }
+        let hand_over = store.hand_over(id).await.expect("read").expect("kept");
+        assert_eq!(
+            hand_over.body, None,
+            "nothing will post it again, so a second copy of the messages is not kept"
         );
         assert_eq!(
-            closed.body, None,
-            "nothing will post it again, so a second copy of the message is not kept"
-        );
-        assert_eq!(
-            closed.key.as_deref(),
-            Some("key-1-0"),
+            hand_over.key, "meka-bridge-1",
             "the key stays: it is what names this hand-over in Meka's own logs"
         );
         let stats = store.queue_stats().await.expect("stats");
-        assert_eq!((stats.failed, stats.in_flight), (1, 0));
+        assert_eq!((stats.failed, stats.in_flight), (2, 0));
         assert!(
             !store
-                .delivered(seq, now())
+                .delivered(id, now())
                 .await
-                .expect("a closed row must not fail the write"),
-            "a closed row is not reopened by a later event"
+                .expect("a closed hand-over must not fail the write"),
+            "a closed hand-over is not reopened by a later event"
         );
     }
 
@@ -7331,20 +7600,24 @@ mod tests {
             Some(Backlog { watermark, through }),
         )
         .await;
-        store
-            .hold(
-                stating,
-                HandOver {
-                    key: "unused",
-                    body: "body",
-                    session_id: Uuid::nil(),
-                    dropped: 4,
-                    accounted: None,
-                },
-                now(),
-            )
-            .await
-            .expect("a second hold is refused");
+        assert_eq!(
+            store
+                .hold(
+                    NewHandOver {
+                        key: "unused",
+                        body: "body",
+                        session_id: Uuid::nil(),
+                        rows: &[stating.seq],
+                        dropped: 4,
+                        accounted: &[],
+                    },
+                    now(),
+                )
+                .await
+                .expect("hold"),
+            None,
+            "a second hold is refused"
+        );
         assert_eq!(
             store
                 .unseen_summary(Some("telegram:1"))
@@ -7379,7 +7652,10 @@ mod tests {
         .await;
 
         // The first one dies. Exactly its two rows come back, and the count it reported with them.
-        store.failed(stating, "gone", now()).await.expect("fail");
+        store
+            .failed(hand_over_of(&stating), "gone", now())
+            .await
+            .expect("fail");
         let owed = store
             .history("telegram:1", &[], 10, None, None)
             .await
@@ -7401,7 +7677,7 @@ mod tests {
 
         // And the survivor still owns its own slice, which is given back only if it dies too.
         store
-            .reoffer(second, "withdrawn", 3, None, now())
+            .reoffer(hand_over_of(&second), "withdrawn", 3, None, now())
             .await
             .expect("reoffer");
         assert_eq!(
@@ -7506,33 +7782,33 @@ mod tests {
             .expect("enqueue");
         let claimed = claim_all(&store, 10).await;
         let held = hold_all(&store, &claimed).await;
-        let seq = held[0].seq;
+        let id = hand_over_of(&held[0]);
         store
-            .posted(seq, Uuid::nil(), "item-1", now(), None)
+            .posted(id, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
         assert_eq!(store.clear_queue().await.expect("clear"), 1);
-        assert_eq!(store.row_by_item("item-1").await.expect("read"), None);
+        assert_eq!(store.hand_over_by_item("item-1").await.expect("read"), None);
 
         assert!(
             !store
-                .delivered(seq, now())
+                .delivered(id, now())
                 .await
-                .expect("a vanished row must not fail the write")
+                .expect("a vanished hand-over must not fail the write")
         );
         assert!(
             store
-                .failed(seq, "gone", now())
+                .failed(id, "gone", now())
                 .await
-                .expect("a vanished row must not fail the write")
-                .is_none()
+                .expect("a vanished hand-over must not fail the write")
+                .is_empty()
         );
         assert_eq!(
             store
-                .reoffer(seq, "gone", 3, None, now())
+                .reoffer(id, "gone", 3, None, now())
                 .await
-                .expect("a vanished row must not fail the write"),
-            Offer::Closed
+                .expect("a vanished hand-over must not fail the write"),
+            Reoffer::default()
         );
         let stats = store.queue_stats().await.expect("stats");
         assert_eq!(stats, QueueStats::default(), "{stats:?}");
@@ -7559,7 +7835,7 @@ mod tests {
         assert_eq!(count, 2);
         store.note_dropped(3).await.expect("note");
 
-        let seq = hand_over(
+        let outstanding = hand_over(
             &store,
             account,
             "telegram:1",
@@ -7568,7 +7844,13 @@ mod tests {
         )
         .await;
         store
-            .posted(seq, Uuid::nil(), "item-1", now(), None)
+            .posted(
+                hand_over_of(&outstanding),
+                Uuid::nil(),
+                "item-1",
+                now(),
+                None,
+            )
             .await
             .expect("post");
         assert_eq!(
@@ -7632,7 +7914,10 @@ mod tests {
             .await
             .expect("mark");
 
-        store.failed(stating, "gone", now()).await.expect("fail");
+        store
+            .failed(hand_over_of(&stating), "gone", now())
+            .await
+            .expect("fail");
         let owed = store
             .history("telegram:1", &[], 10, None, None)
             .await
@@ -7685,7 +7970,7 @@ mod tests {
             .take_unseen("telegram:1", through, 10)
             .await
             .expect("take");
-        let seq = hand_over(
+        let delivered = hand_over(
             &store,
             account,
             "telegram:1",
@@ -7693,7 +7978,10 @@ mod tests {
             Some(Backlog { watermark, through }),
         )
         .await;
-        store.delivered(seq, now()).await.expect("deliver");
+        store
+            .delivered(hand_over_of(&delivered), now())
+            .await
+            .expect("deliver");
 
         assert_eq!(
             store
@@ -7701,6 +7989,14 @@ mod tests {
                 .await
                 .expect("prune"),
             1
+        );
+        assert_eq!(
+            store
+                .hand_over(hand_over_of(&delivered))
+                .await
+                .expect("read"),
+            None,
+            "a hand-over goes with the last of its rows, taking its copy of the messages"
         );
         assert_eq!(
             store
@@ -7752,7 +8048,10 @@ mod tests {
         }
         let claimed = claim_all(&store, 1).await;
         let held = hold_all(&store, &claimed).await;
-        store.delivered(held[0].seq, now()).await.expect("deliver");
+        store
+            .delivered(hand_over_of(&held[0]), now())
+            .await
+            .expect("deliver");
 
         // Both rows carry a 30-day-old `received_at`, because that is the platform's send time and
         // an edit inherits the original message's. Retention is measured from delivery instead, so
@@ -7786,7 +8085,7 @@ mod tests {
         let claimed = claim_all(&store, 10).await;
         let held = hold_all(&store, &claimed).await;
         store
-            .failed(held[0].seq, "gave up", now())
+            .failed(hand_over_of(&held[0]), "gave up", now())
             .await
             .expect("fail");
         let pruned = store
@@ -8617,7 +8916,10 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].message_id, "held-by-a-turn");
         assert_eq!(claimed[0].attempts, 1, "what was charged stays charged");
-        assert_eq!(claimed[0].key, None, "and nothing is rendered for it yet");
+        assert_eq!(
+            claimed[0].hand_over, None,
+            "and nothing is rendered for it yet"
+        );
         let columns: Vec<String> = store
             .connection
             .call(|connection| {
@@ -8631,17 +8933,10 @@ mod tests {
             !columns.iter().any(|name| name == "recovered"),
             "{columns:?}"
         );
-        for added in [
-            "key",
-            "body",
-            "session_id",
-            "item_id",
-            "dropped",
-            "posts",
-            "held_at",
-        ] {
-            assert!(columns.iter().any(|name| name == added), "{columns:?}");
-        }
+        assert!(
+            columns.iter().any(|name| name == "hand_over_id"),
+            "{columns:?}"
+        );
         let accounted: Vec<String> = store
             .connection
             .call(|connection| {
@@ -8655,6 +8950,206 @@ mod tests {
             accounted.iter().any(|name| name == "accounted_by"),
             "{accounted:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn every_item_from_before_hand_overs_becomes_one_byte_for_byte() {
+        // The upgrade a deployment takes with items still out: one Meka holds, one it never
+        // accepted, one given up on, and a message waiting to be claimed. Each item becomes a
+        // hand-over of its own under the key it was made with, so Meka is still asked about it
+        // under that key, and the backlog an item stated stays tied to the row that stated it.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        let session = Uuid::new_v4();
+        let recorded = session.to_string();
+        legacy_database(&path, 15, move |connection| {
+            connection.execute(
+                "INSERT INTO conversations (address, channel, platform, kind, created_at)
+                 VALUES ('telegram:1', 'telegram', 'telegram', 'direct', '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO accounts
+                     (channel, platform, platform_id, first_seen_at, last_seen_at)
+                 VALUES ('telegram', 'telegram', '111', '2026-09-01T00:00:00Z',
+                         '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            for (seq, message, state, key, body, item, posts, not_before, error) in [
+                (
+                    1,
+                    "posted",
+                    "posted",
+                    Some("k-posted"),
+                    Some("posted body"),
+                    Some("item-1"),
+                    1,
+                    None,
+                    None,
+                ),
+                (
+                    2,
+                    "waiting",
+                    "in_flight",
+                    Some("k-waiting"),
+                    Some("waiting body"),
+                    None,
+                    3,
+                    Some("2026-09-01T00:05:00+00:00"),
+                    Some("connection refused"),
+                ),
+                (
+                    3,
+                    "pending",
+                    "pending",
+                    None,
+                    None,
+                    None,
+                    0,
+                    Some("2026-09-01T00:06:00+00:00"),
+                    Some("withdrawn"),
+                ),
+                (
+                    4,
+                    "failed",
+                    "failed",
+                    Some("k-failed"),
+                    None,
+                    Some("item-4"),
+                    2,
+                    None,
+                    Some("gave up"),
+                ),
+            ] {
+                let keyed = key.is_some();
+                connection.execute(
+                    "INSERT INTO inbound_queue
+                         (seq, conversation_id, account_id, message_id, revision, payload,
+                          received_at, state, key, body, session_id, item_id, dropped, attempts,
+                          posts, not_before, last_error, held_at, posted_at, retry_until)
+                     VALUES (?1, 1, 1, ?2, 0, 'payload', '2026-09-01T00:00:00+00:00', ?3, ?4, ?5,
+                             ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    rusqlite::params![
+                        seq,
+                        message,
+                        state,
+                        key,
+                        body,
+                        keyed.then_some(recorded.as_str()),
+                        item,
+                        if seq == 1 { 2 } else { 0 },
+                        posts,
+                        not_before,
+                        error,
+                        keyed.then_some("2026-09-01T00:01:00+00:00"),
+                        item.map(|_| "2026-09-01T00:02:00+00:00"),
+                        (seq == 1).then_some("2026-09-01T01:00:00+00:00"),
+                    ],
+                )?;
+            }
+            connection.execute(
+                "INSERT INTO messages
+                     (conversation_id, account_id, message_id, sender_name, text, timestamp, seen,
+                      accounted_by)
+                 VALUES (1, 1, 'earlier', 'Alice', 'said before', '2026-09-01T00:00:00Z', 1, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await;
+
+        let store = Store::open(&path).await.expect("upgrades");
+        let at = |raw: &str| {
+            DateTime::parse_from_rfc3339(raw)
+                .expect("literal parses")
+                .with_timezone(&Utc)
+        };
+
+        let posted = store
+            .hand_over_by_item("item-1")
+            .await
+            .expect("read")
+            .expect("the item Meka holds is still found by its id");
+        assert_eq!(
+            (
+                posted.key.as_str(),
+                posted.body.as_deref(),
+                posted.session_id,
+                posted.dropped,
+                posted.posts
+            ),
+            ("k-posted", Some("posted body"), session, 2, 1)
+        );
+        assert_eq!(posted.retry_until, Some(at("2026-09-01T01:00:00+00:00")));
+        assert_eq!(posted.rows.len(), 1);
+        assert_eq!(posted.rows[0].state, QueueState::Posted);
+
+        let waiting = store
+            .hand_overs_in(QueueState::InFlight)
+            .await
+            .expect("list");
+        let [waiting] = waiting.as_slice() else {
+            panic!("one item waits on Meka: {waiting:?}");
+        };
+        assert_eq!(waiting.key, "k-waiting");
+        assert_eq!(waiting.body.as_deref(), Some("waiting body"));
+        assert_eq!(waiting.posts, 3);
+        assert_eq!(waiting.not_before, Some(at("2026-09-01T00:05:00+00:00")));
+        assert_eq!(waiting.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(
+            (
+                waiting.rows[0].not_before,
+                waiting.rows[0].last_error.as_deref()
+            ),
+            (None, None),
+            "what described its posts moved to the hand-over"
+        );
+
+        let pending = store.peek_pending(10).await.expect("peek");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].hand_over, None);
+        assert_eq!(pending[0].not_before, Some(at("2026-09-01T00:06:00+00:00")));
+        assert_eq!(
+            pending[0].last_error.as_deref(),
+            Some("withdrawn"),
+            "a row waiting to be claimed keeps its own"
+        );
+
+        let failed = store
+            .hand_over_by_item("item-4")
+            .await
+            .expect("read")
+            .expect("the item given up on keeps its name");
+        assert_eq!(
+            (failed.key.as_str(), failed.body.as_deref()),
+            ("k-failed", None)
+        );
+        assert_eq!(failed.rows[0].last_error.as_deref(), Some("gave up"));
+
+        // The posted item failing now gives back the backlog it stated, which only works if the
+        // stamp naming its row survived the upgrade.
+        store.failed(posted.id, "gone", now()).await.expect("fail");
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            1,
+            "the backlog it stated is owed again"
+        );
+        let columns: Vec<String> = store
+            .connection
+            .call(|connection| {
+                let mut statement = connection.prepare("PRAGMA table_info(inbound_queue)")?;
+                let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+                names.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .expect("columns");
+        for moved in ["key", "body", "session_id", "item_id", "posts", "held_at"] {
+            assert!(!columns.iter().any(|name| name == moved), "{columns:?}");
+        }
     }
 
     #[tokio::test]

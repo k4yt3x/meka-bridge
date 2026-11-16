@@ -83,9 +83,9 @@ Meka retries a failed MCP connect in the background with backoff, so starting th
 Message your bot. The log should show it being handed over and read:
 
 ```
-INFO meka_bridge::bridge::inbound: rendered messages for the agent messages=1 conversations=1
-INFO meka_bridge::bridge::inbound: handed a message to the agent seq=1 item=... replayed=false
-INFO meka_bridge::bridge::inbound: the agent read a message seq=1 conversation=telegram:123456789
+INFO meka_bridge::bridge::inbound: rendered messages for the agent hand_over=1 messages=1 conversations=1
+INFO meka_bridge::bridge::inbound: handed messages to the agent hand_over=1 messages=1 item=... replayed=false
+INFO meka_bridge::bridge::inbound: the agent read messages hand_over=1 messages=1 conversations=1
 INFO meka_bridge::bridge: the agent sent a message conversation=telegram:123456789 parts=1
 ```
 

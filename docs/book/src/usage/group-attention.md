@@ -90,7 +90,7 @@ schedule_create(
 )
 ```
 
-One turn, at a time the agent picked, framed by the agent as a look-back rather than a summons. The
+One look, at a time the agent picked, framed by the agent as a look-back rather than a summons. The
 prompt is delivered with no human present, so it has to carry its own context.
 
 ### Listen for a word
@@ -104,9 +104,9 @@ watch_write(name: "my-deploy", patterns: ["rolling back", "rollback"], reason: "
 
 See [Watches](#watches) below.
 
-### Gate a scheduled job
+### Gate a schedule
 
-For rooms worth sweeping on a timer, a recurring job with a gate costs nothing while they are
+For rooms worth sweeping on a timer, a recurring schedule with a gate costs nothing while they are
 quiet. `backlog_check` is the gate, and a tool gate runs at `read`:
 
 ```
@@ -131,12 +131,12 @@ stands; `unseen` is the backlog and falls whenever the agent reads or is handed 
 watching that for a change would fire on the reading and announce news the agent had just been
 handed. Gating on the whole result has the same fault, since it contains both. `{ at: "/newest",
 is: "not_empty" }` is the other useful gate: it fires for as long as anything is unread, which
-suits a job that should keep at it until it has read everything, every page of it. Point a gate
+suits a schedule that should keep at it until it has read everything, every page of it. Point a gate
 into `conversations` only at a chat the question named: an unnamed one leaves the answer once its
 backlog is read, and a `changed` gate fires on that.
 
-`meka-bridge unseen` is the shell form of the same question, for a gate outside Meka or a job that
-predates the tool:
+`meka-bridge unseen` is the shell form of the same question, for a gate outside Meka or a schedule
+that predates the tool:
 
 ```
 schedule_create(
@@ -148,7 +148,7 @@ schedule_create(
 
 Prefer the tool gate. A shell gate runs unattended with no sandbox, so Meka requires
 `permission = "unrestricted"` to create one; a tool gate needs only `read`, and so does an ungated
-`at:` job.
+`at:` schedule.
 
 Pair it with `history_read(after: <cursor>)` in the prompt and the sweep reads exactly what it has
 not seen: keep the newest `cursor` you were handed, pass it back next time, and nothing is read

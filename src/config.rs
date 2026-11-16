@@ -119,11 +119,12 @@ pub struct BridgeConfig {
     /// Conversation that receives operator notifications, such as a turn that failed every retry.
     pub owner_conversation: Option<String>,
     pub max_queue_depth: usize,
-    /// Ceiling on how many messages one pass claims, renders and posts.
+    /// Ceiling on how many messages one pass claims and hands over, which is also the most one
+    /// inbox item carries.
     ///
-    /// Not a ceiling on what one turn reads: Meka takes every item posted around it, so a burst
-    /// wider than this is posted over consecutive passes and still reaches the agent in one
-    /// turn. What it bounds is how much work is in flight on this side at once.
+    /// A burst wider than this is handed over as more than one item, and the agent reads the
+    /// first before the rest. What it bounds is the size of one item and how much work is in
+    /// flight on this side at once.
     pub batch_max_messages: usize,
     /// Quiet period a conversation goes through before its messages are handed to the agent, on
     /// platforms that report when somebody is typing.

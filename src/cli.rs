@@ -113,7 +113,7 @@ pub enum Command {
         search: Option<String>,
     },
 
-    /// Report what the agent has not been shown, for use as a scheduled job's gate.
+    /// Report what the agent has not been shown, for use as a schedule's gate.
     ///
     /// Exits 0 when something is waiting, 1 when nothing is, and 2 when the question could not be
     /// answered. The three are distinct on purpose: a watcher that treats a failure as "nothing

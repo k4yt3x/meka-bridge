@@ -29,7 +29,7 @@ How to reach `meka serve`.
 | `connect_timeout` | `10s` | TCP connect budget |
 | `max_retries` | `3` | Attempts against retryable failures on read-only calls |
 
-Handing a message over is never retried at this layer. The schedule belongs on the row instead, where it survives a restart and `meka-bridge queue list` can show it.
+Handing a message over is never retried at this layer. The schedule belongs on the hand-over instead, where it survives a restart and `meka-bridge queue list` can show it.
 
 > **`turn_timeout` was removed in 0.14.0 and a config still setting it is refused at startup by name.** It was a ceiling on a turn this bridge held open end to end, and it holds none: a message goes into Meka's inbox and Meka runs the turn. Delete the line. Since Meka 0.51 nothing times out a reply on either side, so if you want a ceiling it belongs in Meka rather than in a client that is no longer watching.
 
@@ -78,7 +78,7 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
 | `settle` | `3s` | Quiet period a chat goes through before its messages reach the agent, **on platforms that report typing**. Ignored elsewhere. `0s` turns it off |
 | `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported, and does not override a message waiting out a retry |
-| `batch_max_messages` | `32` | Most messages claimed, rendered and posted in one pass. Not a limit on what one turn reads: Meka takes every item posted around it |
+| `batch_max_messages` | `32` | Most messages handed over in one pass, which is also the most one inbox item carries. A burst wider than this goes over as more than one item, and the agent reads the first before the rest |
 | `typing_indicator` | `true` | Show a typing state in the originating chats while the model is writing a message, and at no other time |
 | `typing_max` | `2m` | Ceiling on how long one such window may last. Not a safety net: it is the only thing that closes a window whose closing event never arrives |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |

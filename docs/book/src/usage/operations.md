@@ -79,9 +79,11 @@ Every inbound message is written to SQLite before the agent is woken for it, and
 WARN meka_bridge::bridge::inbound: recovered hand-overs the previous run left open orphaned=1 unposted=1 posted=2
 ```
 
-- **`orphaned`**: rows claimed with nothing ever rendered for them. Nothing reached Meka, so they go straight back to the queue.
-- **`unposted`**: an item was rendered and never posted. The same bytes go out under the same key, rather than a fresh item that would state a backlog already marked seen and so state nothing at all.
-- **`posted`**: Meka has the item and its fate is unknown. The feed's replay usually says, and every one of them is asked about under its own key as soon as the feed is open, so nothing waits on an outcome that has been and gone.
+Each count is of messages.
+
+- **`orphaned`**: claimed with nothing ever rendered for them. Nothing reached Meka, so they go straight back to the queue.
+- **`unposted`**: in an item that was rendered and never posted. The same bytes go out under the same key, rather than a fresh item that would state a backlog already marked seen and so state nothing at all.
+- **`posted`**: in an item Meka has, whose fate is unknown. The feed's replay usually says, and every such item is asked about under its own key as soon as the feed is open, so nothing waits on an outcome that has been and gone.
 
 `meka-bridge queue list` shows the same states, per row, while the bridge runs.
 
@@ -100,23 +102,23 @@ That is what the restart policy is for. Both platforms now cover an outage of up
 | Line | Meaning |
 |------|---------|
 | `following the session feed` | The feed is open. Everything below that reports an outcome arrives on it |
-| `rendered messages for the agent` | A settled pass became one inbox item per message. None has left yet |
-| `handed a message to the agent` | Meka accepted the item and now owns getting it read. `replayed=true` means Meka already had it, which is how a restart settles rather than sends twice |
+| `rendered messages for the agent` | A settled pass became one inbox item, the hand-over `hand_over` names. Nothing has left yet |
+| `handed messages to the agent` | Meka accepted the item and now owns getting it read. `replayed=true` means Meka already had it, which is how a restart settles rather than sends twice |
 | `the agent was woken for this bridge's messages` | Meka opened a turn on one of this bridge's items. Once per turn: a feed rejoining a turn already running says so at debug instead, so counting these counts turns |
-| `the agent read a message` | The provider accepted a request carrying it, so the model has seen it. This, and only this, is what marks a message delivered |
+| `the agent read messages` | The provider accepted a request carrying the item, so the model has seen every message in it. This, and only this, is what marks a message delivered |
 | `turn finished sends=N tool_calls=N` | A turn that carried this bridge's messages ended. `messages` says how many it read |
 | `the agent sent no messages this turn` | The agent read them and sent nothing. Legal, but logged at warn with the text it produced instead, because from the other end it is indistinguishable from a broken bridge |
 | `the model returned an empty response` | The provider came back with no content and no tool calls. Nothing ran, so the messages are offered again. `stop_reason` says how the reply ended, such as `max_tokens` or `content_filter` |
-| `Meka did not accept a message (...); trying again` | The post did not get through. `retry_in` says how long it waits, doubling from 10s to 5m |
-| `giving up on a message Meka never accepted` | An hour of posts, none of which got through. The message goes back among what the agent has not seen and both the chat and the owner are told |
-| `Meka refused a message` | A refusal no wait can clear: a rejected token, a malformed request, a context overflow. Given up on at once, so this arrives seconds after the message rather than an hour later |
-| `Meka gave up on a message` | Meka gave the item up: a turn on it failed in a way no retry changes, or its retries ran past Meka's `[serve] inbox_retry_ceiling`. The line carries the error it was given up on. Same outcome as the line above, decided on the other side |
+| `Meka did not accept messages (...); trying again` | The post did not get through. `retry_in` says how long it waits, doubling from 10s to 5m |
+| `giving up on messages Meka never accepted` | An hour of posts, none of which got through. The messages go back among what the agent has not seen and both the chats and the owner are told |
+| `Meka refused messages` | A refusal no wait can clear: a rejected token, a malformed request, a context overflow. Given up on at once, so this arrives seconds after the messages rather than an hour later |
+| `Meka gave up on messages` | Meka gave the item up: a turn on it failed in a way no retry changes, or its retries ran past Meka's `[serve] inbox_retry_ceiling`. The line carries the error it was given up on. Same outcome as the line above, decided on the other side |
 | `a turn on this bridge's messages failed and Meka will try again` | Meka put the messages back after a turn failed in a way waiting can change: an outage, a spent quota, a required MCP server not yet up. `next_attempt` says when. The owner is told at once; the chats only if Meka gives up |
 | `Meka moved the agent's turns to a fallback profile` | The agent's own profile could not serve a turn and Meka used one of its `fallbacks`. Logged on every move; the owner is told at most once every fifteen minutes, with a count of the moves in between |
 | `the agent's turns are back on its own profile` | The fallback is over. The owner is told this too, under the same limit |
-| `turns on this bridge's messages get through again` | A message was delivered after the owner was told Meka was retrying a failing turn. The owner is told |
+| `turns on this bridge's messages get through again` | One of this bridge's items was delivered after the owner was told Meka was retrying a failing turn. The owner is told. An item somebody else put in the inbox, a schedule's fire say, does not count |
 | `could not look up a channel a message arrived in, so lookups pause` | Discord's API did not answer a lookup for a channel or thread the gateway had not announced. For the next minute, a message in such a channel reads as an unknown room, and one in a thread admitted only through its parent is dropped |
-| `a message did not reach the agent (...); it is offered again` | Its item was taken back unread, or the turn that read it produced nothing at all. It is handed over afresh under a new key |
+| `messages did not reach the agent (...); they are offered again` | Their item was taken back unread, or the turn that read it produced nothing at all. They are handed over afresh under a new key, beside whatever else has settled |
 | `the turn ended after the agent had read this bridge's messages` | Not offered again, and the messages are marked delivered. Meka only retries an upstream failure while nothing has reached its frontend, so one that gets this far may have a sent message and a shell command behind it |
 | `Meka compacted the session; earlier conversations are now a summary` | Meka summarised the session to make room, so what the agent remembers of chats nobody is in right now is a summary from here on. `trigger` says what set it off: `reactive` or `proactive` when the window filled, `emergency` when the provider refused a request as too large, `requested` when the agent asked, `manual` when somebody ran a compact, `retention` when old turns aged out. Empty from a Meka before 0.84 |
 | `Meka could not compact the session` | A compaction ended without making room, with Meka's reason. At error, saying the context is full, when the window forced it: turns in every chat are likely to be refused next. See below |

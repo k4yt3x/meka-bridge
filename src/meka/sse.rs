@@ -17,8 +17,8 @@ pub enum TurnSource {
     Client,
     /// Meka opened the turn on waiting inbox items, which it names.
     Inbox { item_ids: Vec<String> },
-    /// A scheduled job fired.
-    Schedule { job_id: String },
+    /// Fires of these schedules, and nothing else, opened the turn.
+    Schedule { schedule_ids: Vec<String> },
     /// A background task reported back and earned a turn of its own.
     Background,
     /// A source this build does not act on, such as the `compaction` of the checkpoint turn `POST
@@ -254,7 +254,11 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
                     item_ids: strings("item_ids"),
                 },
                 Some("schedule") => TurnSource::Schedule {
-                    job_id: string("job_id"),
+                    // Before Meka 0.95 a scheduled job ran a turn of its own, named by `job_id`.
+                    schedule_ids: match value.get("schedule_ids") {
+                        Some(_) => strings("schedule_ids"),
+                        None => optional_string("job_id").into_iter().collect(),
+                    },
                 },
                 Some("background") => TurnSource::Background,
                 other => TurnSource::Unknown(other.unwrap_or_default().to_string()),
@@ -550,15 +554,27 @@ mod tests {
                 ..
             }
         ));
+        // Meka 0.95 names the schedules and the inbox items standing for their fires; before it,
+        // the one scheduled job.
+        assert!(matches!(
+            event(
+                "turn.started",
+                r#"{"turn_id":"t3","source":"schedule","item_ids":["i7"],"schedule_ids":["s9"]}"#
+            ),
+            TurnEvent::Started {
+                source: TurnSource::Schedule { schedule_ids },
+                ..
+            } if schedule_ids == ["s9"]
+        ));
         assert!(matches!(
             event(
                 "turn.started",
                 r#"{"turn_id":"t3","source":"schedule","job_id":"j9"}"#
             ),
             TurnEvent::Started {
-                source: TurnSource::Schedule { job_id },
+                source: TurnSource::Schedule { schedule_ids },
                 ..
-            } if job_id == "j9"
+            } if schedule_ids == ["j9"]
         ));
         assert!(matches!(
             event("turn.started", r#"{"turn_id":"t4","source":"background"}"#),

@@ -45,21 +45,21 @@ Claiming happens in one transaction, so a session task racing a restart cannot h
 
 ## Why a hand-over is written down
 
-One claimed message becomes one **inbox item**, and its queue row *is* the hand-over: the same row holds the `Idempotency-Key`, the rendered item byte for byte, and whatever that item stated once and nothing else will state again.
+One claimed pass becomes one **inbox item**, and the item has a record of its own, the hand-over: it holds the `Idempotency-Key`, the rendered item byte for byte, Meka's id for it, and whatever that item stated once and nothing else will state again. Each queue row names the hand-over carrying its message, and whatever Meka says about the item is said of every message in it.
 
-Two things fall into that last category. The count of messages the queue had to shed is carried by the first item of a claimed pass. A conversation's backlog is carried by the first item from that conversation, and every history row it named is marked seen against that row (`messages.accounted_by`) in the same transaction that stores the item. A read through `history_read` by the session the bridge hands messages to marks what it returns seen as well, and takes it off any hand-over that had accounted for it, since it has been shown whatever becomes of that item.
+Two things fall into that last category. The count of messages the queue had to shed is stated once at the top of the item. A conversation's backlog is stated ahead of that conversation's messages, and every history row it named is marked seen against the conversation's first row in the item (`messages.accounted_by`) in the same transaction that stores the item. A read through `history_read` by the session the bridge hands messages to marks what it returns seen as well, and takes it off any hand-over that had accounted for it, since it has been shown whatever becomes of that item.
 
 All of it exists for the same moment: a bridge that stops between posting an item and hearing what became of it. On the next start it posts the same bytes under the same key, and Meka answers with the item it already made and that item's current state rather than making a second. If the item is never read, the shed count goes back on the counter and exactly the rows it named are owed again.
 
-Per row rather than per batch, because two hand-overs can be outstanding for one conversation at once. What has already been reported is then a *set*, not a high-water mark: the first item states the backlog and marks it seen, the second counts only what has landed since, and if the first dies it gives back its own half while the second keeps its own. A watermark cannot express that.
+Against a row rather than as a watermark, because two hand-overs can be outstanding for one conversation at once. What has already been reported is then a *set*, not a high-water mark: the first item states the backlog and marks it seen, the second counts only what has landed since, and if the first dies it gives back its own half while the second keeps its own. A watermark cannot express that.
 
 The same question is asked whenever the feed reconnects, and whenever Meka says the feed has a hole in it. A hand-over is never left waiting on an outcome that has already been and gone.
 
-## Why messages still arrive together
+## Why messages arrive together
 
-Five messages that settle together are claimed together and posted as five items, one after another. Meka reads them all into one turn -- whatever is waiting when it opens, and the rest at its next round boundaries -- so the agent sees all five in that turn under a header Meka writes above each. That matches what happens to a person who puts their phone down: they come back to the whole conversation, not one message at a time. It also saves a provider round trip per message, which on a long turn is the difference between one call and five.
+Five messages that settle together are claimed together and handed over as one item, so the agent reads all five before it answers any of them. That matches what happens to a person who puts their phone down: they come back to the whole conversation, not one message at a time. It also saves a provider round trip per message, which on a long turn is the difference between one call and five.
 
-The batching is Meka's, not the bridge's. Doing it here as well would mean a second unit of hand-over with its own state, its own retries and its own idea of what had been reported, all describing something the server already does.
+The batching is the bridge's, because which messages belong together is the bridge's fact. Meka reads items as they reach it: five posted one after another have the first open a turn on its own, and the other four wait for that turn's first pause, by which time the agent may have answered "hey" without seeing the question that followed it. Arrival timing cannot say that the five belong together, and one item does.
 
 What decides when they go is the chat going quiet, not a turn running. The session task waits for that before claiming anything, so somebody typing a thought across three messages is read once rather than answered after the first fragment. Tying it to a turn instead would make turn duration the control, and a slower model would batch better, which is backwards.
 
@@ -71,7 +71,7 @@ Both are derived from the `received_at` already on each queue row rather than fr
 
 It is handed over the moment it settles, whatever Meka is doing. Every item is posted as a `steer`, which Meka reads into the running turn at its next round boundary, after that round's tool results and before the next request. So somebody correcting themselves ten seconds into a ten-minute task is read inside that task, the way a person glances at a message mid-job.
 
-Nothing is cancelled to make room, and nothing waits for a turn to end. A message that lands during a scheduled job or a background-outcome turn is read by that turn.
+Nothing is cancelled to make room, and nothing waits for a turn to end. A message that lands during a turn on a schedule's fire or a background outcome is read by that turn.
 
 Meka writes its own header above each item, naming this bridge as the sender, when it arrived, and whether it landed mid-turn. That replaces the `late:` line the bridge used to add: it was a claim about a reply that had already gone out, which the bridge could only guess at, and there is no longer a gap for it to describe.
 
@@ -95,7 +95,7 @@ check the deploy logs
 7c1e4b>>>
 ```
 
-One item per message, so there is nothing to number and no count to state: Meka writes its own header above each item, naming the sender and when it arrived, and a line here saying the same thing could only disagree with it.
+An item carrying several messages says so on a line of its own (`[Meka Bridge] 3 messages from 2 conversations, each conversation's together and oldest first.`), and renders each conversation's messages together, behind what that conversation owes the agent. Every message keeps the whole block above, conversation line and labels included, so the agent never has to look further up the item to know where a message came from or how far to trust it. Meka writes its own header above the item, naming this bridge and when it arrived.
 
 User text is fenced by a per-item random nonce. Without it, a message reading `conversation: telegram:999` would be indistinguishable from a real header, and a user could talk the agent into messaging somebody else. The nonce is unpredictable, so a forged header can only appear inside a fence where it is visibly quoted content, and any occurrence of the nonce itself is stripped from the text before fencing.
 

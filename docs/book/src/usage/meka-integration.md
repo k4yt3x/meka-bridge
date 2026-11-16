@@ -8,37 +8,37 @@ With a Claude profile, Meka 0.86 or later is worth having. On an older Meka, a C
 
 ## How a message gets to the agent
 
-Every message is one **inbox item** of its own:
+Every message that settles in one pass goes into one **inbox item**:
 
 ```
 POST /v1/sessions/{id}/inbox
 Idempotency-Key: meka-bridge-<uuid>
 
-{"message": "<the rendered message>", "class": "steer", "source": "Meka Bridge"}
+{"message": "<the rendered messages>", "class": "steer", "source": "Meka Bridge"}
 ```
 
-One per message rather than one per settled burst, because Meka already batches: one turn reads
-every item posted around it, writing one block per item into a user message, and takes whatever
-lands mid-turn at its next round boundary. Five messages that settle together are five posts back to
-back and still one turn. Batching here as well would mean a
-second unit of hand-over, with its own state, its own retries, and its own idea of what it had
-already told the agent, all describing something the server does anyway.
+One item per settled burst rather than one per message, because which messages belong together is
+the bridge's to say, and only one item says it. Meka reads items as they reach it: posted one after
+another, the first message of a burst wakes the session and opens a turn on its own, and the rest
+wait for that turn's first pause, by which time the agent may have answered half of what somebody
+said. Inside the item each message keeps a block of its own, with each conversation's messages
+together and oldest first; see [What one item looks like](../architecture.md#what-one-item-looks-like).
+A burst wider than `[bridge].batch_max_messages` is handed over as more than one item.
 
 `class` is the whole contract. A `steer` reaches a turn that is already running, at its next round
 boundary, after that round's tool results and before the next request; on an idle session it opens a
 turn of its own. So a message that lands ten seconds into a ten-minute task is read inside that
-task, and one that lands during a scheduled job is read by the job's turn. Nothing waits for a turn
-to end, and nothing is cancelled to make room.
+task, and one that lands while the agent answers a schedule's fire is read by that turn. Nothing
+waits for a turn to end, and nothing is cancelled to make room.
 
 The other two classes are deliberately not used. A `followup` reproduces exactly the wait the inbox
 exists to end, and an `interrupt` would cut a reply being written to one person because somebody
 else wrote.
 
 `source` is what Meka names in the header it writes above each item, so the agent reads one name for
-this bridge, the one its MCP instructions use. Without it the header would name nobody. That header is also why the bridge
-numbers nothing: Meka says which item is which, and a count written here could only disagree with
-it. The item's own fence is unchanged and still does the work: Meka passes the body through
-verbatim, which is why a client relaying text from strangers fences it itself.
+this bridge, the one its MCP instructions use. Without it the header would name nobody. The item's
+own fence still does the work: Meka passes the body through verbatim, which is why a client relaying
+text from strangers fences it itself.
 
 ## Delivery accounting
 
@@ -47,25 +47,26 @@ explicit about the difference: `inbox.delivered` fires when the provider accepts
 the item, not when its text was written down, and an item Meka has accepted is one Meka may still
 give up on.
 
-That is why the hand-over is written on the queue row rather than lost with the request. The row
-holds the `Idempotency-Key`, the rendered item byte for byte, and whatever that item stated once:
-the count of messages the queue had to shed, and, through `messages.accounted_by`, the exact history
-rows whose backlog it reported. A bridge that stops between posting an item and hearing what became
-of it posts the same bytes under the same key on the next start, and Meka answers with the item it
-already made and that item's current state. Nobody is handed a second copy, and if the item was
-never read the shed count and those exact rows are owed again.
+That is why the hand-over is written down rather than lost with the request. Its record holds the
+`Idempotency-Key`, the rendered item byte for byte, and whatever that item stated once: the count of
+messages the queue had to shed, and, through `messages.accounted_by`, the exact history rows whose
+backlog it reported. Each queue row names the hand-over carrying its message, and what Meka says of
+the item is said of every message in it. A bridge that stops between posting an item and hearing
+what became of it posts the same bytes under the same key on the next start, and Meka answers with
+the item it already made and that item's current state. Nobody is handed a second copy, and if the
+item was never read the shed count and those exact rows are owed again.
 
-Per row, because two hand-overs can be outstanding for one conversation at once: the first states
-the backlog and marks it seen, the second states only what has landed since, and one of them dying
-gives back its own half and leaves the other's alone.
+Against a row rather than as a watermark, because two hand-overs can be outstanding for one
+conversation at once: the first states the backlog and marks it seen, the second states only what
+has landed since, and one of them dying gives back its own half and leaves the other's alone.
 
 Three events settle a hand-over, and the bridge acts on each differently:
 
 | Event | What it means | What the bridge does |
 |-------|---------------|----------------------|
-| `inbox.delivered` | The model read it | The message is delivered |
-| `inbox.failed` | Meka gave up on it: a turn failed in a way no retry changes, or retrying ran past Meka's `[serve] inbox_retry_ceiling`, an hour by default | The message is owed to the agent again, with whatever its item stated, and the chat and the owner are told, the owner with the error Meka gave it up on |
-| `inbox.withdrawn` | It was taken back unread, as cancelling the turn it opened does | The message goes back into the queue and is handed over afresh, a bounded number of times |
+| `inbox.delivered` | The model read it | Every message in it is delivered |
+| `inbox.failed` | Meka gave up on it: a turn failed in a way no retry changes, or retrying ran past Meka's `[serve] inbox_retry_ceiling`, an hour by default | Its messages are owed to the agent again, with whatever the item stated, and every chat that lost one and the owner are told, the owner with the error Meka gave it up on |
+| `inbox.withdrawn` | It was taken back unread, as cancelling the turn it opened does | Its messages go back into the queue and are handed over afresh, beside whatever else has settled, a bounded number of times |
 
 A fourth, `inbox.deferred`, settles nothing: a turn on the messages failed before the model read them, in a way waiting can change (an outage, a spent quota, a required MCP server not yet up), and Meka has put them back to try again. The owner is told then, with the error, when Meka tries next and when it will give up, because nobody waiting hears back until a turn gets through and the chats are told only once Meka stops. The owner's notice is rate limited to one every fifteen minutes, on a window of its own, so it never holds back the notice that Meka gave up.
 
@@ -87,8 +88,8 @@ Last-Event-ID: <the last event acted on>
 A Meka before 0.89 serves it at `/v1/sessions/{id}/stream` instead and has no `/feed`, as 0.89 has no `/stream`. The bridge asks first wherever the feed last opened, and at the other path when Meka has no route for that one, so it follows Meka through an upgrade or a downgrade without a restart or a setting.
 
 It carries every turn on the session, whoever started it, and does not end with one. That is how the
-bridge sees the turns nobody asked it for, a scheduled job firing at three in the morning or a
-background task reporting back, and it is the only place an item's fate is reported.
+bridge sees the turns nobody asked it for, a schedule firing at three in the morning or a background
+task reporting back, and it is the only place an item's fate is reported.
 
 Holding it open does two things beyond reading. Meka does not evict a session with a live feed
 subscriber, and opening the feed loads one that was evicted, so the bridge's session stays reachable
@@ -205,13 +206,13 @@ thing.
 `unseen`, `newest` and `latest` are where they were, so a gate pointing at `/latest` needs only its
 arguments changed. See [MCP Tools](./mcp-tools.md#backlog_check).
 
-**Unlike 0.18.0's changes, this one is in stored state.** A scheduled job keeps the arguments its
+**Unlike 0.18.0's changes, this one is in stored state.** A schedule keeps the arguments its
 gate was created with, so a watcher the agent set up before the upgrade still passes
 `conversation`. That argument is refused by name rather than ignored, since ignoring it would have
 quietly widened the watcher to every chat. A gate pointing at a field, as `/latest` does, then
 fails: Meka logs a warning carrying the refusal, and tells the agent once the failure persists. A
 gate comparing the whole result instead fires once, showing the agent the refusal, and then stays
-quiet for good. Recreate those jobs with `conversations: ["<id>"]`, or ask the agent to; the
+quiet for good. Recreate those schedules with `conversations: ["<id>"]`, or ask the agent to; the
 refusal names the call to make. `meka-bridge unseen <id>` is unchanged, so a shell gate keeps
 working.
 
