@@ -232,7 +232,7 @@ While the model is writing a message, the chats it is answering show a typing in
 
 It stops on whichever comes first:
 
-- **The arguments are written.** Whatever tool Meka announces next closes the window, which is also what covers a call the model abandoned halfway.
+- **The arguments are written.** Meka reports the send call as written, or announces the next tool call, which is also what covers a call the model abandoned halfway.
 - **The agent sends a message there.** Telegram already clears the status when a message from the bot arrives, so re-arming it afterwards would tell somebody who was just answered that a second message is coming.
 - **`[bridge].typing_max` passes**, two minutes by default. It is the only thing that closes a window whose closing event never arrives.
 

@@ -1,10 +1,16 @@
 //! What a turn on the feed is doing, and the presence signalling that goes with it.
 //!
-//! The typing window is closed by the next `tool_call.executing` or `tool_call.composing`, not by
-//! one carrying the id that opened it. Meka emits `composing` without marking the attempt as having
-//! produced output, so a call whose arguments never finish is safe to retry, and a retry mints
-//! fresh tool ids while the `composing` already on the wire cannot be taken back. Matching on the
-//! id waits for one that never arrives, leaving the indicator up until the turn ends.
+//! The typing window is closed by the next `tool_call.composing`, whatever its id, or by the
+//! `tool_call.executing` of the call that opened it. The model writes one call at a time, so the
+//! next call announced means the one before it is written or abandoned. Meka emits `composing`
+//! without marking the attempt as having produced output, so a call whose arguments never finish is
+//! safe to retry, and a retry mints fresh tool ids while the `composing` already on the wire cannot
+//! be taken back; waiting for that id's `executing` would leave the indicator up until the turn
+//! ends.
+//!
+//! An `executing` closes only its own call's window because Meka draws each part of a reply as it
+//! arrives. An endpoint that closes a call late puts that call's `executing` after the next call's
+//! `composing`, while the next message is still being written.
 //!
 //! A turn that dies mid-call emits no closing event either, which is why the window is closed when
 //! the turn ends rather than only by an event.
@@ -180,6 +186,14 @@ impl TurnTally {
     }
 }
 
+/// The indicator drawn while one send call's arguments are written.
+struct ComposingWindow {
+    /// The call whose `tool_call.composing` opened the window.
+    call_id: String,
+    /// Ends the indicator in every chat the window draws in.
+    token: CancellationToken,
+}
+
 /// Draws the typing indicator in the chats a turn is answering, while the model writes a message.
 ///
 /// Keyed by turn because the feed carries every turn on the session, and a window opened by one
@@ -199,7 +213,7 @@ pub struct TurnTypist {
     /// Shared with the outbound sink so the indicator can stop once a reply has actually landed.
     presence: Arc<Presence>,
     /// The open composing window of each turn.
-    windows: HashMap<String, CancellationToken>,
+    windows: HashMap<String, ComposingWindow>,
     /// Which conversations each turn is answering.
     targets: HashMap<String, BTreeSet<ConversationId>>,
 }
@@ -236,7 +250,7 @@ impl TurnTypist {
                 self.targets.len()
             );
             for (_, window) in self.windows.drain() {
-                window.cancel();
+                window.token.cancel();
             }
             self.targets.clear();
         }
@@ -254,13 +268,13 @@ impl TurnTypist {
     /// Open or close a window on a tool-call event of `turn`.
     pub fn observe(&mut self, turn: &str, event: &TurnEvent) {
         match event {
-            TurnEvent::ToolCallComposing { name, .. } => {
+            TurnEvent::ToolCallComposing { id, name } => {
                 // Closes first, unconditionally. A second `composing` means the previous call
                 // is over one way or another: either its arguments finished, or Meka retried
                 // the round and the call being announced now is its replacement. Clearing the
                 // presence record belongs to `start_typing`, which owns the window it opens.
                 if let Some(previous) = self.windows.remove(turn) {
-                    previous.cancel();
+                    previous.token.cancel();
                 }
                 if !name.ends_with(SEND_TOOL_SUFFIX) {
                     return;
@@ -270,14 +284,23 @@ impl TurnTypist {
                     return;
                 };
                 let token = self.start_typing(conversations);
-                self.windows.insert(turn.to_string(), token);
+                self.windows.insert(turn.to_string(), ComposingWindow {
+                    call_id: id.clone(),
+                    token,
+                });
             }
-            TurnEvent::ToolCallStarted { .. } => {
-                // The arguments are written, so whatever was being composed is composed. Closed
-                // here rather than left to the send landing, because a send that fails never
-                // lands and would leave the indicator up until the turn ended.
-                if let Some(window) = self.windows.remove(turn) {
-                    window.cancel();
+            TurnEvent::ToolCallStarted { id, .. } => {
+                // This call's arguments are written. Closed here rather than left to the send
+                // landing, because a send that fails never lands and would leave the indicator up
+                // until the turn ended. Only the window this call opened is closed, since a call
+                // that ends late reports so after the next call has opened its own.
+                if self
+                    .windows
+                    .get(turn)
+                    .is_some_and(|window| window.call_id == *id)
+                    && let Some(window) = self.windows.remove(turn)
+                {
+                    window.token.cancel();
                 }
             }
             _ => {}
@@ -287,7 +310,7 @@ impl TurnTypist {
     /// The turn ended; nothing it was composing is coming.
     pub fn close(&mut self, turn: &str) {
         if let Some(window) = self.windows.remove(turn) {
-            window.cancel();
+            window.token.cancel();
         }
         self.targets.remove(turn);
     }
@@ -781,8 +804,8 @@ mod tests {
             "the window was not drawn: {while_composing}"
         );
 
-        // The arguments are finished: the next event on the turn closes the window, and a
-        // different turn's events leave it alone.
+        // The arguments are finished: the call's own `executing` closes the window, and a different
+        // turn's events leave it alone.
         typist.observe("t2", &executing("mcp__meka-bridge__message_send"));
         typist.observe("t1", &executing("mcp__meka-bridge__message_send"));
         tokio::time::sleep(TYPING_REFRESH * 3).await;
@@ -790,6 +813,48 @@ mod tests {
             channel.activity_count(),
             while_composing,
             "the window stayed open past the call that closed it"
+        );
+        typist.close("t1");
+    }
+
+    /// A call that ends late reports `executing` after the next call's `composing`, and that report
+    /// must leave the next message's window open until its own call reports.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_executing_leaves_the_next_calls_window_open() {
+        let channel = Arc::new(SpyChannel::new());
+        let mut typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
+        let send = "mcp__meka-bridge__message_send";
+        let composing = |id: &str| TurnEvent::ToolCallComposing {
+            id: id.to_string(),
+            name: send.to_string(),
+        };
+        let executing = |id: &str| TurnEvent::ToolCallStarted {
+            id: id.to_string(),
+            name: send.to_string(),
+            display_summary: None,
+        };
+        typist.begin("t1");
+        typist.expect("t1", conversations());
+
+        typist.observe("t1", &composing("first"));
+        typist.observe("t1", &composing("second"));
+        typist.observe("t1", &executing("first"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let opened = channel.activity_count();
+        tokio::time::sleep(TYPING_REFRESH * 2).await;
+        assert!(
+            channel.activity_count() > opened,
+            "the second message's window closed with the first call"
+        );
+
+        typist.observe("t1", &executing("second"));
+        tokio::time::sleep(TYPING_REFRESH).await;
+        let closed = channel.activity_count();
+        tokio::time::sleep(TYPING_REFRESH * 3).await;
+        assert_eq!(
+            channel.activity_count(),
+            closed,
+            "the window stayed open past its own call"
         );
         typist.close("t1");
     }

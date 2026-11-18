@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.4] - 2026-11-18
+
+### Fixed
+
+- The typing indicator no longer drops early on endpoints that close a tool call late.
+
 ## [0.25.3] - 2026-11-16
 
 ### Changed
@@ -714,7 +720,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.3...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.4...HEAD
+[0.25.4]: https://github.com/k4yt3x/meka-bridge/compare/0.25.3...0.25.4
 [0.25.3]: https://github.com/k4yt3x/meka-bridge/compare/0.25.2...0.25.3
 [0.25.2]: https://github.com/k4yt3x/meka-bridge/compare/0.25.1...0.25.2
 [0.25.1]: https://github.com/k4yt3x/meka-bridge/compare/0.25.0...0.25.1
